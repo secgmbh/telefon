@@ -1,5 +1,6 @@
 flask
 twilio
-openai
-requests
+openai>=1.1.0
+pandas
 gunicorn
+requests
