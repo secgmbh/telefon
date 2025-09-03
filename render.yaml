@@ -1,7 +1,6 @@
-
 services:
   - type: web
-    name: telefon-assistent
+    name: telefon-assistent-dialog
     env: python
     startCommand: gunicorn main:app
     plan: free
