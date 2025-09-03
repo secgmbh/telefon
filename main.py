@@ -1,16 +1,18 @@
-import os
-import openai
-import pandas as pd
-from flask import Flask, request, Response
+from flask import Flask, request
 from twilio.twiml.voice_response import VoiceResponse
+import openai
+import requests
+from io import BytesIO
+import os
 
 app = Flask(__name__)
 
-# Lade CSV-Datei
-df = pd.read_csv("verknuepfte_tabelle_final_bereinigt.csv", sep=";")
-
-# API-Key von Umgebungsvariable laden
+# OpenAI API-Key aus Umgebungsvariable lesen
 openai.api_key = os.getenv("OPENAI_API_KEY")
+
+@app.route("/", methods=["GET"])
+def index():
+    return "KI-Telefonassistent ist aktiv."
 
 @app.route("/telefon", methods=["POST"])
 def telefon():
@@ -18,51 +20,47 @@ def telefon():
     response.say("Willkommen bei wowona. Bitte stellen Sie Ihre Frage nach dem Piepton.", language="de-DE")
     response.record(
         action="/antwort",
+        maxLength=10,
         method="POST",
-        maxLength="10",
         playBeep=True,
         transcribe=False
     )
-    return Response(str(response), mimetype="application/xml")
+    return str(response)
 
 @app.route("/antwort", methods=["POST"])
 def antwort():
+    recording_url = request.form.get("RecordingUrl")
+    if not recording_url:
+        return "<Response><Say>Keine Aufnahme empfangen.</Say></Response>"
+
     try:
-        recording_url = request.form["RecordingUrl"]
-        audio_url = recording_url + ".wav"
-        audio_file_path = "/tmp/audio.wav"
+        # Audio von Twilio herunterladen
+        audio_response = requests.get(recording_url + ".wav")
+        audio_response.raise_for_status()
+        audio_file = BytesIO(audio_response.content)
 
-        import requests
-        with open(audio_file_path, "wb") as f:
-            f.write(requests.get(audio_url).content)
+        # Whisper Transkription
+        transcript = openai.audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_file,
+            response_format="text"
+        )
 
-        with open(audio_file_path, "rb") as audio_file:
-            transcription = openai.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file
-            )
-        frage = transcription.text
-
-        # Suche in der CSV-Datei
-        antwort = "Ich konnte leider keine passende Information finden."
-        for _, row in df.iterrows():
-            if str(row["Name"]).lower() in frage.lower():
-                antwort = f"{row['Name']} hat den Status: {row['Status']}, letzte Bestellung: {row['Bestellung']}."
-                break
-
-        response = VoiceResponse()
-        response.say(antwort, language="de-DE")
-        return Response(str(response), mimetype="application/xml")
+        # GPT-Antwort generieren
+        chat_response = openai.chat.completions.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": transcript}]
+        )
+        antwort_text = chat_response.choices[0].message.content.strip()
 
     except Exception as e:
-        print(f"Fehler: {e}")
-        response = VoiceResponse()
-        response.say("Es ist ein Fehler aufgetreten. Bitte versuchen Sie es später erneut.", language="de-DE")
-        return Response(str(response), mimetype="application/xml")
+        print("Fehler:", e)
+        return "<Response><Say>Es ist ein Fehler aufgetreten. Bitte versuchen Sie es später erneut.</Say></Response>"
 
-@app.route("/", methods=["GET"])
-def index():
-    return "KI-Telefonassistent läuft."
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say language="de-DE">{antwort_text}</Say>
+</Response>"""
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
