@@ -1,5 +1,5 @@
 from flask import Flask, request, Response
-from twilio.twiml.voice_response import VoiceResponse, Say, Record
+from twilio.twiml.voice_response import VoiceResponse
 import openai
 import os
 import tempfile
@@ -25,45 +25,55 @@ def telefon():
 
 @app.route("/antwort", methods=["POST"])
 def antwort():
-    recording_url = request.form.get("RecordingUrl")
-    call_sid = request.form.get("CallSid")
+    try:
+        recording_url = request.form.get("RecordingUrl")
+        call_sid = request.form.get("CallSid")
 
-    if not recording_url:
-        return "Fehlende Aufnahme"
+        if not recording_url:
+            raise ValueError("RecordingUrl fehlt")
 
-    audio_url = f"{recording_url}.mp3"
-    audio_data = requests.get(audio_url).content
+        # 1. Download Audio
+        audio_url = f"{recording_url}.mp3"
+        audio_data = requests.get(audio_url).content
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
-        tmp.write(audio_data)
-        tmp_path = tmp.name
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp:
+            tmp.write(audio_data)
+            tmp_path = tmp.name
 
-    with open(tmp_path, "rb") as audio_file:
-        transcript = openai.Audio.transcribe("whisper-1", audio_file)["text"]
+        # 2. Transkription via Whisper
+        with open(tmp_path, "rb") as audio_file:
+            transcript = openai.Audio.transcribe("whisper-1", audio_file)["text"]
 
-    os.remove(tmp_path)
+        os.remove(tmp_path)
 
-    prompt = f"Der Benutzer hat gesagt: '{transcript}'. Gib eine höfliche Antwort auf Deutsch."
-    history = conversation_history.get(call_sid, [])
-    history.append({"role": "user", "content": transcript})
+        # 3. GPT antwortet
+        history = conversation_history.get(call_sid, [])
+        history.append({"role": "user", "content": transcript})
 
-    completion = openai.ChatCompletion.create(
-        model="gpt-4",
-        messages=[{"role": "system", "content": "Du bist ein freundlicher deutschsprachiger Kundendienstassistent."}] + history,
-    )
-    antwort_text = completion.choices[0].message["content"]
-    history.append({"role": "assistant", "content": antwort_text})
-    conversation_history[call_sid] = history
+        completion = openai.ChatCompletion.create(
+            model="gpt-4",
+            messages=[{"role": "system", "content": "Du bist ein freundlicher deutschsprachiger Kundendienstassistent."}] + history,
+        )
+        antwort_text = completion.choices[0].message["content"]
+        history.append({"role": "assistant", "content": antwort_text})
+        conversation_history[call_sid] = history
 
-    response = VoiceResponse()
-    response.say(antwort_text, language="de-DE")
-    response.pause(length=1)
-    response.say("Möchten Sie noch etwas wissen?", language="de-DE")
-    response.record(
-        action="/antwort",
-        maxLength=10,
-        method="POST",
-        transcribe=False,
-        playBeep=True
-    )
-    return Response(str(response), mimetype="text/xml")
+        # 4. Antwort zurück an Anrufer
+        response = VoiceResponse()
+        response.say(antwort_text, language="de-DE")
+        response.pause(length=1)
+        response.say("Möchten Sie noch etwas wissen?", language="de-DE")
+        response.record(
+            action="/antwort",
+            maxLength=10,
+            method="POST",
+            transcribe=False,
+            playBeep=True
+        )
+        return Response(str(response), mimetype="text/xml")
+
+    except Exception as e:
+        print("Fehler in /antwort:", str(e))
+        response = VoiceResponse()
+        response.say("Es ist ein Fehler aufgetreten. Bitte versuchen Sie es später erneut.", language="de-DE")
+        return Response(str(response), mimetype="text/xml")
