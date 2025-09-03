@@ -1,44 +1,20 @@
+
 from flask import Flask, request, Response
 from twilio.twiml.voice_response import VoiceResponse
-from openai import OpenAI
 import pandas as pd
 
 app = Flask(__name__)
-client = OpenAI(api_key="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")  # Ersetze durch deinen echten Key
-
 df = pd.read_csv("verknuepfte_tabelle_final_bereinigt.csv", sep=';', engine='python')
 
 @app.route("/telefon", methods=["POST"])
 def telefon():
     response = VoiceResponse()
-    user_input = request.form.get('SpeechResult', '')
-    caller_number = request.form.get('From', '')
+    response.say("Willkommen beim KI Telefonassistenten. Bitte stellen Sie Ihre Frage nach dem Piepton.", language="de-DE")
+    response.record(max_length=10, action="/antwort", method="POST")
+    return Response(str(response), mimetype="text/xml")
 
-    customer_info = df[df['RA Tel'].astype(str).str.contains(caller_number[-7:], na=False)]
-    for _, row in customer_info.iterrows():
-        bestellnummer = row.get('Bestellnummer', '')
-        produkt = row.get('product_name', '')
-        status = row.get('order_status', '')
-        tracking = row.get('shipping_tracking', '')
-        break
-    else:
-        bestellnummer = produkt = status = tracking = 'nicht gefunden'
-
-    system_prompt = f"Du bist ein deutscher E-Commerce Kundensupport Bot. Die Bestellnummer ist {bestellnummer}, Produkt: {produkt}, Status: {status}, Trackingnummer: {tracking}. Antworte freundlich, kurz und hilfsbereit."
-
-    completion = client.chat.completions.create(
-        model="gpt-4o-preview",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_input}
-        ]
-    )
-
-    gpt_response = completion.choices[0].message.content
-    response.say(gpt_response, language='de-DE', voice='Polly.Vicki')
-    response.gather(input='speech', language='de-DE', timeout=5)
-    return Response(str(response), mimetype='text/xml')
-
-@app.route("/telefon", methods=["GET"])
-def status():
-    return "✅ KI-Telefonassistent läuft auf Render."
+@app.route("/antwort", methods=["POST"])
+def antwort():
+    response = VoiceResponse()
+    response.say("Vielen Dank für Ihre Nachricht. Wir melden uns in Kürze.", language="de-DE")
+    return Response(str(response), mimetype="text/xml")
