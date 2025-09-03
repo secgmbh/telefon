@@ -15,7 +15,11 @@ except Exception as e:
 def telefon():
     response = VoiceResponse()
     response.say("Willkommen beim KI-Telefonassistenten. Bitte stellen Sie Ihre Frage nach dem Piepton.", language="de-DE")
-    response.record(max_length=10, action="/antwort", method="POST")
+    response.record(
+    max_length=10,
+    action="https://telefon-qb6i.onrender.com/antwort",
+    method="POST"
+)
     return Response(str(response), mimetype="text/xml")
 
 @app.route("/antwort", methods=["POST"])
