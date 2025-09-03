@@ -1,17 +1,20 @@
-from flask import Flask, request
+import os
+import requests
+from flask import Flask, request, Response
 from twilio.twiml.voice_response import VoiceResponse
 import openai
-import requests
-from io import BytesIO
-import os
 
 app = Flask(__name__)
 
-# OpenAI API-Key aus Umgebungsvariable lesen
+# OpenAI API-Key aus Umgebungsvariable
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
+# Twilio Account SID und Auth Token aus Umgebungsvariablen
+account_sid = os.getenv("AC1ab8ebc060f9c4350fd8e43cfc2438be")
+auth_token = os.getenv("14e18bba76650b22a18a8958a9329a6d")
+
 @app.route("/", methods=["GET"])
-def index():
+def home():
     return "KI-Telefonassistent ist aktiv."
 
 @app.route("/telefon", methods=["POST"])
@@ -20,47 +23,58 @@ def telefon():
     response.say("Willkommen bei wowona. Bitte stellen Sie Ihre Frage nach dem Piepton.", language="de-DE")
     response.record(
         action="/antwort",
-        maxLength=10,
         method="POST",
-        playBeep=True,
+        max_length=10,
+        play_beep=True,
         transcribe=False
     )
-    return str(response)
+    return Response(str(response), mimetype="application/xml")
 
 @app.route("/antwort", methods=["POST"])
 def antwort():
     recording_url = request.form.get("RecordingUrl")
-    if not recording_url:
-        return "<Response><Say>Keine Aufnahme empfangen.</Say></Response>"
 
     try:
-        # Audio von Twilio herunterladen
-        audio_response = requests.get(recording_url + ".wav")
-        audio_response.raise_for_status()
-        audio_file = BytesIO(audio_response.content)
+        if not recording_url:
+            raise ValueError("Keine Aufnahme-URL erhalten.")
 
-        # Whisper Transkription
-        transcript = openai.audio.transcriptions.create(
-            model="whisper-1",
-            file=audio_file,
-            response_format="text"
-        )
+        audio_url = recording_url + ".wav"
+
+        # Audio mit Authentifizierung herunterladen
+        response = requests.get(audio_url, auth=(account_sid, auth_token))
+        response.raise_for_status()
+
+        with open("aufnahme.wav", "wb") as f:
+            f.write(response.content)
+
+        # OpenAI Whisper Transkription
+        with open("aufnahme.wav", "rb") as audio_file:
+            transcript_response = openai.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file,
+                response_format="text",
+                language="de"
+            )
+        transcript = transcript_response.strip()
 
         # GPT-Antwort generieren
         chat_response = openai.chat.completions.create(
             model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": transcript}]
+            messages=[
+                {"role": "system", "content": "Du bist ein freundlicher Telefonassistent von wowona."},
+                {"role": "user", "content": transcript}
+            ]
         )
-        antwort_text = chat_response.choices[0].message.content.strip()
+
+        antwort = chat_response.choices[0].message.content
 
     except Exception as e:
-        print("Fehler:", e)
-        return "<Response><Say>Es ist ein Fehler aufgetreten. Bitte versuchen Sie es später erneut.</Say></Response>"
+        print(f"Fehler: {e}")
+        antwort = "Es ist ein Fehler aufgetreten. Bitte versuchen Sie es später erneut."
 
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say language="de-DE">{antwort_text}</Say>
-</Response>"""
+    twilio_response = VoiceResponse()
+    twilio_response.say(antwort, language="de-DE")
+    return Response(str(twilio_response), mimetype="application/xml")
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(debug=False, port=5000, host="0.0.0.0")
