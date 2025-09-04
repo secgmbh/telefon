@@ -1,71 +1,65 @@
+
 import os
 from flask import Flask, request, Response
-from dotenv import load_dotenv
-import openai
 import requests
-from pydub import AudioSegment
-from io import BytesIO
+from dotenv import load_dotenv
 
+# Lade Umgebungsvariablen aus .env-Datei
 load_dotenv()
 
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-openai.api_key = os.getenv("OPENAI_API_KEY")
-
+# Flask App
 app = Flask(__name__)
 
-@app.route("/")
-def home():
-    return "Telefon-Assistent läuft"
+# Twilio Credentials aus Umgebungsvariablen
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 
+# Home Route
+@app.route("/", methods=["GET"])
+def index():
+    return "Telefon-Assistent läuft."
+
+# Begrüßung und Aufnahme starten
 @app.route("/telefon", methods=["POST"])
 def telefon():
-    response = """<?xml version="1.0" encoding="UTF-8"?>
+    response = '''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Say language="de-DE">Willkommen bei wowona. Mein Name ist Maria. Wie kann ich Dir helfen?</Say>
     <Record action="/antwort" maxLength="10" playBeep="false" transcribe="false" />
-</Response>"""
-    return Response(response, mimetype="text/xml")
+</Response>'''
+    return Response(response, mimetype="application/xml")
 
+# Aufnahme entgegennehmen und Antwort generieren
 @app.route("/antwort", methods=["POST"])
 def antwort():
     try:
         recording_url = request.form.get("RecordingUrl")
-        print("Recording URL:", recording_url)
-
         if not recording_url:
             raise ValueError("Keine Aufnahme-URL erhalten.")
 
-        audio_response = requests.get(f"{recording_url}.wav", auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
+        print("Recording URL:", recording_url)
 
-        if audio_response.status_code != 200:
-            raise ValueError(f"Fehler beim Abrufen der Audioaufnahme: {audio_response.status_code} - {audio_response.text}")
+        # Lade Audio-Datei im unterstützten Format (z. B. .mp3)
+        audio_response = requests.get(f"{recording_url}.mp3", auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
+        audio_response.raise_for_status()
 
-        audio = AudioSegment.from_file(BytesIO(audio_response.content), format="wav")
-        mp3_io = BytesIO()
-        audio.export(mp3_io, format="mp3")
-        mp3_io.seek(0)
+        # Speichere temporär
+        with open("aufnahme.mp3", "wb") as f:
+            f.write(audio_response.content)
 
-        try:
-            transcript = openai.Audio.transcribe("whisper-1", mp3_io)
-            antwort = transcript.get("text", "").strip()
-            if not antwort:
-                raise ValueError("Keine Transkription erhalten.")
-        except Exception as e:
-            print(f"Transkriptionsfehler: {e}")
-            return Response("""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say language="de-DE">Leider konnte ich dich nicht verstehen. Bitte wiederhole deine Frage.</Say>
-</Response>""", mimetype="text/xml")
+        # Hier kannst du die Datei an OpenAI senden oder verarbeiten
+        # z. B. mit speech-to-text oder einer Antwort erzeugen
 
-        return Response(f"""<?xml version="1.0" encoding="UTF-8"?>
+        antwort = "Danke für deine Nachricht. Wir melden uns bei dir."
+    except Exception as e:
+        print("Fehler bei der Verarbeitung:", str(e))
+        antwort = "Es ist ein Fehler aufgetreten. Bitte versuche es später erneut."
+
+    response = f'''<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Say language="de-DE">{antwort}</Say>
-</Response>""", mimetype="text/xml")
+</Response>'''
+    return Response(response, mimetype="application/xml")
 
-    except Exception as e:
-        print(f"Fehler bei der Verarbeitung: {e}")
-        return Response("""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say language="de-DE">Es ist ein Fehler aufgetreten. Bitte schaue dir die Software nochmals an. ho.</Say>
-</Response>""", mimetype="text/xml")
+# App exportieren
+app = app
