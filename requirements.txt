@@ -1,8 +1,7 @@
 flask
 twilio
-openai>=1.0.0
+openai
+pydub
+requests
 python-dotenv
 pandas
-requests
-gunicorn
-pydub
