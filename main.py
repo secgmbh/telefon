@@ -75,5 +75,5 @@ CSV-Daten:
         print("Fehler bei der Verarbeitung:", e)
         return Response("""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say language="de-DE">Es ist ein Fehler aufgetreten. Bitte versuchen Sie es später erneut.</Say>
+    <Say language="de-DE">Es ist ein Fehler aufgetreten. Probiere es nochmals. he he.</Say>
 </Response>""", mimetype="text/xml")
