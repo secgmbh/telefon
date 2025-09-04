@@ -72,5 +72,5 @@ def antwort():
     except Exception as e:
         print("Fehler:", e)
         response = VoiceResponse()
-        response.say("Es ist ein Fehler aufgetreten. Bitte versuchen Sie es später erneut.", language="de-DE")
+        response.say("Es ist ein Fehler aufgetreten. Bitte schaue dir die Software nochmals an. Ha ha ha.", language="de-DE")
         return Response(str(response), mimetype="text/xml")
