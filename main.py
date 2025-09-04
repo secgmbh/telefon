@@ -1,79 +1,75 @@
+
 import os
 import requests
 import pandas as pd
 from flask import Flask, request, Response
 from dotenv import load_dotenv
-from openai import OpenAI
+import openai
 
 load_dotenv()
 
-# API-Schlüssel aus Umgebungsvariablen laden
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+openai.api_key = OPENAI_API_KEY
+
+df = pd.read_csv("verknuepfte_tabelle_final_bereinigt.csv")
 
 app = Flask(__name__)
 
-# CSV-Datei laden
-CSV_PATH = "verknuepfte_tabelle_final_bereinigt.csv"
-df = pd.read_csv(CSV_PATH, dtype=str)
-
-# GPT vorbereiten
-client = OpenAI(api_key=OPENAI_API_KEY)
-
 @app.route("/", methods=["GET"])
 def index():
-    return "Server läuft."
+    return "Telefon-Service läuft!"
 
 @app.route("/telefon", methods=["POST"])
 def telefon():
-    return Response("""<?xml version="1.0" encoding="UTF-8"?>
+    response = """<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Say language="de-DE">Willkommen bei wowona. Mein Name ist Maria. Wie kann ich Dir helfen?</Say>
     <Record action="/antwort" maxLength="10" playBeep="false" transcribe="false" />
-</Response>""", mimetype="text/xml")
+</Response>"""
+    return Response(response, mimetype="text/xml")
 
 @app.route("/antwort", methods=["POST"])
 def antwort():
+    data = request.form
+    recording_url = data.get("RecordingUrl")
+
     try:
-        recording_url = request.form["RecordingUrl"]
         audio_response = requests.get(recording_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
-        with open("aufnahme.wav", "wb") as f:
+        audio_response.raise_for_status()
+
+        with open("audio.mp3", "wb") as f:
             f.write(audio_response.content)
 
-        # Transkription (vereinfacht)
-        audio_file = open("aufnahme.wav", "rb")
-        transcript = client.audio.transcriptions.create(
-            model="whisper-1",
-            file=audio_file,
-            language="de"
-        )
-        user_input = transcript.text
+        with open("audio.mp3", "rb") as f:
+            transcript = openai.Audio.transcribe("whisper-1", f)
 
-        # Datenabfrage vorbereiten
+        user_input = transcript["text"]
+
         prompt = f"""Ein Kunde fragt: '{user_input}'
 Suche in den folgenden Rechnungsdaten eine passende Antwort.
-Wenn möglich, nenne den Betrag, die Bestellnummer, oder den Namen.
-CSV-Daten:
-{df.head(30).to_string(index=False)}"""
+Hier ist die Tabelle:
+{df.head(20).to_string(index=False)}
+"""
 
-        gpt_response = client.chat.completions.create(
+        gpt_response = openai.ChatCompletion.create(
             model="gpt-4",
-            messages=[
-                {"role": "system", "content": "Du bist ein hilfreicher Kundendienst-Assistent."},
-                {"role": "user", "content": prompt}
-            ]
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2
         )
-        antwort = gpt_response.choices[0].message.content
 
-        return Response(f"""<?xml version="1.0" encoding="UTF-8"?>
+        antworttext = gpt_response.choices[0].message.content.strip()
+
+        response = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Say language="de-DE">{antwort}</Say>
-</Response>""", mimetype="text/xml")
+    <Say language="de-DE">{antworttext}</Say>
+</Response>"""
+        return Response(response, mimetype="text/xml")
 
     except Exception as e:
-        print("Fehler bei der Verarbeitung:", e)
-        return Response("""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say language="de-DE">Es ist ein Fehler aufgetreten. Probiere es nochmals. he he.</Say>
-</Response>""", mimetype="text/xml")
+        print(f"Fehler bei der Verarbeitung: {e}")
+        return Response("""<?xml version="1.0" encoding="UTF-8"?><Response><Say language="de-DE">Es ist ein Fehler aufgetreten. Probiere es nochmals. he he he</Say></Response>""", mimetype="text/xml")
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
