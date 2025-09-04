@@ -26,45 +26,56 @@ def telefon():
 
 @app.route("/antwort", methods=["POST"])
 def antwort():
-    response = VoiceResponse()
     try:
-        recording_url = request.form["RecordingUrl"] + ".wav"
-        recording_sid = request.form["RecordingSid"]
-        audio_file_path = f"{recording_sid}.wav"
+        recording_url = request.form["RecordingUrl"]
+        print(f"Recording URL: {recording_url}")  # Debug
 
-        r = requests.get(recording_url, auth=(twilio_sid, twilio_auth_token))
-        with open(audio_file_path, "wb") as f:
-            f.write(r.content)
+        audio_response = requests.get(f"{recording_url}.wav", auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
+        audio_response.raise_for_status()
 
-        audio = AudioSegment.from_file(audio_file_path)
-        audio.export(audio_file_path, format="wav")
+        with open("aufnahme.wav", "wb") as f:
+            f.write(audio_response.content)
+        print("Audio erfolgreich heruntergeladen.")
 
-        with open(audio_file_path, "rb") as audio_file:
-            transcript_response = openai.audio.transcriptions.create(model="whisper-1", file=audio_file)
-            user_input = transcript_response.text
+        audio = AudioSegment.from_wav("aufnahme.wav")
+        audio.export("aufnahme.mp3", format="mp3")
+        print("Audio erfolgreich konvertiert.")
 
-        os.remove(audio_file_path)
+        with open("aufnahme.mp3", "rb") as f:
+            transcript = openai.Audio.transcribe("whisper-1", f)
+        print(f"Transkription: {transcript['text']}")
 
-        df = pd.read_csv("verknuepfte_tabelle_final_bereinigt.csv")
-        data_string = df.to_string(index=False)
-        
-        prompt = f"""Ein Kunde fragt: '{user_input}'.
+        user_input = transcript["text"]
+
+        # CSV-Datei laden
+        df = pd.read_csv("verknuepfte_tabelle_final_bereinigt.csv", dtype=str)
+        print("CSV erfolgreich geladen.")
+
+        # Prompt generieren
+        prompt = f"""Ein Kunde fragt: '{user_input}'
 Suche in den folgenden Rechnungsdaten eine passende Antwort.
-{data_string}"""
+{df.to_string(index=False)}"""
 
-        gpt_response = openai.chat.completions.create(
+        completion = openai.ChatCompletion.create(
             model="gpt-4",
-            messages=[
-                {"role": "system", "content": "Du bist ein hilfreicher Telefonassistent."},
-                {"role": "user", "content": prompt}
-            ]
+            messages=[{"role": "user", "content": prompt}]
         )
 
-        antwort_text = gpt_response.choices[0].message.content.strip()
-        response.say(antwort_text, language="de-DE")
+        antwort = completion.choices[0].message["content"]
+        print(f"Antwort: {antwort}")
+
+        return Response(f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say language="de-DE">{antwort}</Say>
+</Response>""", mimetype="text/xml")
+
     except Exception as e:
-        response.say("Es ist ein Fehler aufgetreten. Bitte schaue dir die Software nochmals an. Ha ha ha ha.", language="de-DE")
-    return str(response)
+        print(f"Fehler bei der Verarbeitung: {e}")  # <- Hier wird der tatsächliche Fehler ausgegeben
+        return Response("""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say language="de-DE">Es ist ein Fehler aufgetreten. Bitte schaue dir die Software nochmals an. Ha.</Say>
+</Response>""", mimetype="text/xml")
+
 
 if __name__ == "__main__":
     app.run(debug=True)
