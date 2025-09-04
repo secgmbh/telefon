@@ -20,7 +20,7 @@ def home():
 @app.route("/telefon", methods=["POST"])
 def telefon():
     response = VoiceResponse()
-    response.say("Willkommen bei wowona. Bitte stellen Sie Ihre Frage nach dem Piepton.", language="de-DE")
+    response.say("Willkommen bei wowona. Mein Name ist Maria. Wie kann ich Dir helfen?", language="de-DE")
     response.record(
         action="/antwort",
         method="POST",
