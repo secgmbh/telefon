@@ -2,7 +2,6 @@ import os
 from flask import Flask, request, send_file
 from twilio.twiml.voice_response import VoiceResponse
 import openai
-from pydub import AudioSegment
 import requests
 import pandas as pd
 from dotenv import load_dotenv
