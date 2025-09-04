@@ -37,7 +37,7 @@ def telefon():
 def antwort():
     try:
         recording_url = request.form["RecordingUrl"]
-        audio_response = requests.get(f"{recording_url}.wav", auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
+        audio_response = requests.get(recording_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
         with open("aufnahme.wav", "wb") as f:
             f.write(audio_response.content)
 
