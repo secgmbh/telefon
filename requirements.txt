@@ -4,3 +4,4 @@ openai>=1.1.0
 pandas
 gunicorn
 requests
+python-dotenv

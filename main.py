@@ -63,7 +63,7 @@ Bitte beantworte die Frage höflich auf Deutsch unter Verwendung der folgenden P
 
     except Exception as e:
         print(f"Fehler: {e}")
-        antwort_text = "Es ist ein Fehler aufgetreten. Bitte versuchen Sie es später erneut."
+        antwort_text = "Es ist ein Fehler aufgetreten. Bitte schaue dir die Software nochmals an. Ha ha"
 
     response = VoiceResponse()
     response.say(antwort_text, language="de-DE")
