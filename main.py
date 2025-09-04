@@ -1,32 +1,34 @@
+
 import os
-import openai
-import pandas as pd
-import requests
 from flask import Flask, request, Response
 from twilio.twiml.voice_response import VoiceResponse
+import openai
+import requests
+import pandas as pd
 from dotenv import load_dotenv
 
 load_dotenv()
 
+openai.api_key = os.getenv("OPENAI_API_KEY")
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+
 app = Flask(__name__)
 
-# OpenAI API-Key
-openai.api_key = os.getenv("OPENAI_API_KEY")
-
-# CSV laden
+# CSV-Datei laden
 csv_path = "verknuepfte_tabelle_final_bereinigt.csv"
-df = pd.read_csv(csv_path)
+df = pd.read_csv(csv_path, dtype=str, sep=";", encoding="utf-8")
 
 @app.route("/")
-def home():
+def index():
     return "KI-Telefonassistent läuft!"
 
 @app.route("/telefon", methods=["POST"])
 def telefon():
     response = VoiceResponse()
     response.say("Willkommen bei wowona. Mein Name ist Maria. Wie kann ich Dir helfen?", language="de-DE")
-    response.record(action="/antwort", maxLength=10, method="POST", playBeep=False, transcribe=False)
-    return Response(str(response), mimetype="application/xml")
+    response.record(action="/antwort", max_length=10, method="POST", play_beep="false", transcribe="false")
+    return Response(str(response), mimetype="text/xml")
 
 @app.route("/antwort", methods=["POST"])
 def antwort():
@@ -34,40 +36,41 @@ def antwort():
         recording_url = request.form["RecordingUrl"] + ".wav"
 
         # Audio-Datei herunterladen
-        audio_file = "aufnahme.wav"
-        with requests.get(recording_url, stream=True, auth=(os.getenv("TWILIO_SID"), os.getenv("TWILIO_AUTH_TOKEN"))) as r:
-            r.raise_for_status()
-            with open(audio_file, 'wb') as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-
-        # Transkription mit Whisper v1
-        with open(audio_file, "rb") as af:
-            transcript = openai.audio.transcriptions.create(
-                model="whisper-1",
-                file=af
-            ).text
-
-        # GPT-Frage mit CSV-Kontext beantworten
-        prompt = f'''Ein Kunde fragt: "{transcript}"
-Bitte beantworte die Frage höflich auf Deutsch unter Verwendung der folgenden Produktdaten:
-
-{df.head(10).to_string(index=False)}'''
-
-        completion = openai.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}]
+        audio_response = requests.get(
+            recording_url,
+            auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
         )
 
-        antwort_text = completion.choices[0].message.content
+        with open("aufnahme.wav", "wb") as f:
+            f.write(audio_response.content)
+
+        # Transkription
+        with open("aufnahme.wav", "rb") as audio_file:
+            transcript = openai.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file,
+                response_format="text"
+            )
+
+        user_input = transcript.strip()
+        prompt = f"Ein Kunde fragt: '{user_input}'. Nutze die CSV-Daten, um eine sinnvolle Antwort zu geben."
+
+        # GPT-Antwort erzeugen
+        response = openai.chat.completions.create(
+            model="gpt-4",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.5,
+            max_tokens=300
+        )
+
+        gpt_reply = response.choices[0].message.content.strip()
+
+        twiml_response = VoiceResponse()
+        twiml_response.say(gpt_reply, language="de-DE")
+        return Response(str(twiml_response), mimetype="text/xml")
 
     except Exception as e:
-        print(f"Fehler: {e}")
-        antwort_text = "Es ist ein Fehler aufgetreten. Bitte schaue dir die Software nochmals an. Ha ha"
-
-    response = VoiceResponse()
-    response.say(antwort_text, language="de-DE")
-    return Response(str(response), mimetype="application/xml")
-
-if __name__ == "__main__":
-    app.run(debug=False, host="0.0.0.0", port=5000)
+        print("Fehler:", e)
+        response = VoiceResponse()
+        response.say("Es ist ein Fehler aufgetreten. Bitte versuchen Sie es später erneut.", language="de-DE")
+        return Response(str(response), mimetype="text/xml")
