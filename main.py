@@ -2,20 +2,24 @@ import os
 import requests
 from flask import Flask, request, Response
 from twilio.twiml.voice_response import VoiceResponse
-import openai
+from openai import OpenAI
+from openai import OpenAIError
+from openai import audio
 
 app = Flask(__name__)
 
-# OpenAI API-Key aus Umgebungsvariable
-openai.api_key = os.getenv("OPENAI_API_KEY")
+# API-Schlüssel aus Umgebungsvariablen lesen
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 
-# Twilio Account SID und Auth Token aus Umgebungsvariablen
-account_sid = os.getenv("AC1ab8ebc060f9c4350fd8e43cfc2438be")
-auth_token = os.getenv("14e18bba76650b22a18a8958a9329a6d")
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-@app.route("/", methods=["GET"])
-def home():
-    return "KI-Telefonassistent ist aktiv."
+
+@app.route("/")
+def index():
+    return "KI Telefonassistent läuft."
+
 
 @app.route("/telefon", methods=["POST"])
 def telefon():
@@ -23,58 +27,56 @@ def telefon():
     response.say("Willkommen bei wowona. Mein Name ist Maria. Wie kann ich Dir helfen?", language="de-DE")
     response.record(
         action="/antwort",
-        method="POST",
         max_length=10,
+        method="POST",
         play_beep=True,
         transcribe=False
     )
-    return Response(str(response), mimetype="application/xml")
+    return Response(str(response), mimetype="text/xml")
+
 
 @app.route("/antwort", methods=["POST"])
 def antwort():
-    recording_url = request.form.get("RecordingUrl")
+    recording_url = request.form.get("RecordingUrl", "") + ".wav"
+    response = VoiceResponse()
 
     try:
-        if not recording_url:
-            raise ValueError("Keine Aufnahme-URL erhalten.")
+        audio_response = requests.get(recording_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
+        audio_response.raise_for_status()
 
-        audio_url = recording_url + ".wav"
+        with open("/tmp/aufnahme.wav", "wb") as f:
+            f.write(audio_response.content)
 
-        # Audio mit Authentifizierung herunterladen
-        response = requests.get(audio_url, auth=(account_sid, auth_token))
-        response.raise_for_status()
-
-        with open("aufnahme.wav", "wb") as f:
-            f.write(response.content)
-
-        # OpenAI Whisper Transkription
-        with open("aufnahme.wav", "rb") as audio_file:
-            transcript_response = openai.audio.transcriptions.create(
+        with open("/tmp/aufnahme.wav", "rb") as audio_file:
+            transcription = client.audio.transcriptions.create(
                 model="whisper-1",
                 file=audio_file,
-                response_format="text",
-                language="de"
+                response_format="text"
             )
-        transcript = transcript_response.strip()
 
-        # GPT-Antwort generieren
-        chat_response = openai.chat.completions.create(
-            model="gpt-3.5-turbo",
+        frage = transcription.strip()
+
+        chat_completion = client.chat.completions.create(
+            model="gpt-4",
             messages=[
-                {"role": "system", "content": "Du bist ein freundlicher Telefonassistent von wowona."},
-                {"role": "user", "content": transcript}
+                {"role": "system", "content": "Du bist ein hilfsbereiter Kundenservice Assistent für das Unternehmen wowona."},
+                {"role": "user", "content": frage}
             ]
         )
 
-        antwort = chat_response.choices[0].message.content
+        antwort = chat_completion.choices[0].message.content.strip()
+        response.say(antwort, language="de-DE")
+
+    except OpenAIError as e:
+        print("Fehler:", e)
+        response.say("Es ist ein Fehler mit dem Sprachdienst aufgetreten. Bitte versuchen Sie es später erneut.", language="de-DE")
 
     except Exception as e:
-        print(f"Fehler: {e}")
-        antwort = "Es ist ein Fehler aufgetreten. Bitte versuchen Sie es später erneut."
+        print("Fehler:", e)
+        response.say("Es ist ein Fehler aufgetreten. Bitte versuchen Sie es später erneut.", language="de-DE")
 
-    twilio_response = VoiceResponse()
-    twilio_response.say(antwort, language="de-DE")
-    return Response(str(twilio_response), mimetype="application/xml")
+    return Response(str(response), mimetype="text/xml")
+
 
 if __name__ == "__main__":
-    app.run(debug=False, port=5000, host="0.0.0.0")
+    app.run(host="0.0.0.0", port=5000)
