@@ -1,15 +1,31 @@
 import os
+import openai
+import requests
+import csv
+import tempfile
+import subprocess
 from flask import Flask, request, Response
 from twilio.twiml.voice_response import VoiceResponse
-import requests
-from openai import OpenAI
-from pydub import AudioSegment
 from dotenv import load_dotenv
 
 load_dotenv()
 
 app = Flask(__name__)
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+openai.api_key = os.getenv("OPENAI_API_KEY")
+twilio_sid = os.getenv("TWILIO_ACCOUNT_SID")
+twilio_token = os.getenv("TWILIO_AUTH_TOKEN")
+csv_file = "verknuepfte_tabelle_final_bereinigt.csv"
+
+def get_data_for_invoice(rechnung):
+    try:
+        with open(csv_file, newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("Rechnungsnummer") == rechnung:
+                    return row
+    except Exception as e:
+        print(f"Fehler beim Lesen der CSV: {e}")
+    return None
 
 @app.route("/telefon", methods=["POST"])
 def telefon():
@@ -17,52 +33,72 @@ def telefon():
     response.say("Willkommen bei wowona. Mein Name ist Maria. Wie kann ich Dir helfen?", language="de-DE")
     response.record(
         action="/antwort",
+        maxLength=10,
         method="POST",
-        max_length=10,
-        play_beep=False,
-        transcribe=False
+        playBeep="false",
+        transcribe="false"
     )
-    return Response(str(response), mimetype="text/xml")
+    return Response(str(response), mimetype="application/xml")
 
 @app.route("/antwort", methods=["POST"])
 def antwort():
-    response = VoiceResponse()
-    recording_url = request.form.get("RecordingUrl")
-
     try:
-        # Lade MP3-Datei herunter
-        twilio_sid = os.getenv("TWILIO_SID")
-        twilio_token = os.getenv("TWILIO_AUTH_TOKEN")
-        audio_response = requests.get(recording_url + ".mp3", auth=(twilio_sid, twilio_token))
-        with open("recording.mp3", "wb") as f:
-            f.write(audio_response.content)
+        recording_url = request.form["RecordingUrl"]
+        wav_file_url = recording_url + ".mp3"
 
-        # Konvertiere in WAV
-        sound = AudioSegment.from_mp3("recording.mp3")
-        sound.export("recording.wav", format="wav")
+        # Audio herunterladen
+        audio_response = requests.get(wav_file_url)
+        if audio_response.status_code != 200:
+            raise Exception(f"Download fehlgeschlagen: {audio_response.status_code}")
 
-        # Sende an Whisper
-        with open("recording.wav", "rb") as audio_file:
-            transcription = client.audio.transcriptions.create(
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as mp3_file:
+            mp3_file.write(audio_response.content)
+            mp3_path = mp3_file.name
+
+        wav_path = mp3_path.replace(".mp3", ".wav")
+        subprocess.run(["ffmpeg", "-y", "-i", mp3_path, wav_path], check=True)
+
+        with open(wav_path, "rb") as audio_file:
+            transcript_response = openai.audio.transcriptions.create(
                 model="whisper-1",
-                file=audio_file,
-                response_format="text"
+                file=audio_file
             )
-            user_input = transcription.text
+        user_input = transcript_response.text.strip()
+        print("User Input:", user_input)
 
-        prompt = f"Ein Kunde fragt: '{user_input}'. Bitte antworte höflich und hilfreich auf Deutsch."
-        chat_response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}],
+        prompt = f"Ein Kunde fragt: '{user_input}'
+Suche in den folgenden Rechnungsdaten eine passende Antwort."
+
+        if "rechnung" in user_input.lower():
+            for word in user_input.split():
+                if word.isdigit():
+                    data = get_data_for_invoice(word)
+                    if data:
+                        prompt += f"
+Rechnungsnummer: {word}
+"
+                        for key, value in data.items():
+                            prompt += f"{key}: {value}
+"
+                        break
+
+        chat_completion = openai.chat.completions.create(
+            model="gpt-4",
+            messages=[
+                {"role": "system", "content": "Du bist ein freundlicher Kundenservice Assistent."},
+                {"role": "user", "content": prompt}
+            ]
         )
-        antwort = chat_response.choices[0].message.content
 
-        response.say(antwort, language="de-DE")
+        antwort_text = chat_completion.choices[0].message.content.strip()
+
     except Exception as e:
-        print("Fehler:", e)
-        response.say("Es ist ein Fehler aufgetreten. Bitte schaue dir die Software nochmals an. Ha ha ha ha.", language="de-DE")
+        print(f"Fehler: {e}")
+        antwort_text = "Es ist ein Fehler aufgetreten. Bitte schaue dir die Software nochmals an. Ha ha ha ha."
 
-    return Response(str(response), mimetype="text/xml")
+    response = VoiceResponse()
+    response.say(antwort_text, language="de-DE")
+    return Response(str(response), mimetype="application/xml")
 
 if __name__ == "__main__":
-    app.run(debug=False, port=5000)
+    app.run(debug=False)
