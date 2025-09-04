@@ -1,3 +1,4 @@
+
 import os
 import requests
 from flask import Flask, request, Response
@@ -5,10 +6,6 @@ from dotenv import load_dotenv
 
 # Optional: falls du .env lokal nutzt
 load_dotenv()
-
-# Twilio Zugangsdaten – alternativ aus Umgebungsvariablen
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "AC1ab8ebc060f9c4350fd8e43cfc2438be")
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "1a08c84357f1680778335ee0a12bb7ed")
 
 app = Flask(__name__)
 
@@ -27,26 +24,23 @@ def telefon():
 
 @app.route("/antwort", methods=["POST"])
 def antwort():
-    recording_url = request.form.get("RecordingUrl", "")
-    recording_sid = request.form.get("RecordingSid", "")
-
-    print(f"Recording URL: {recording_url}")
-
-    if not recording_url:
-        return twilio_error_response("Keine Aufnahme-URL erhalten.")
-
     try:
-        # Anfrage mit Authentifizierung – wie curl -u
-        full_url = f"{recording_url}.mp3"
-        response = requests.get(full_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
+        # Direkt eingebunden wie gewünscht
+        recording_url = request.form['RecordingUrl'] + '.mp3'
 
-        response.raise_for_status()  # Fehler werfen bei 4xx/5xx
+        sid = "AC1ab8ebc060f9c4350fd8e43cfc2438be"
+        token = "1a08c84357f1680778335ee0a12bb7ed"
 
-        # Speichern der MP3-Datei
+        audio_response = requests.get(recording_url, auth=(sid, token))
+
+        # Status prüfen
+        print("Status Code:", audio_response.status_code)
+        audio_response.raise_for_status()
+
         with open("recording.mp3", "wb") as f:
-            f.write(response.content)
+            f.write(audio_response.content)
 
-        print(f"Aufnahme gespeichert als recording.mp3 ({len(response.content)} Bytes)")
+        print(f"Aufnahme gespeichert als recording.mp3 ({len(audio_response.content)} Bytes)")
 
         return twilio_response("Vielen Dank für Ihre Nachricht. Wir melden uns bald bei Ihnen.")
 
