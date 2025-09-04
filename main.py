@@ -12,7 +12,7 @@ app = Flask(__name__)
 # Hilfsfunktion: Antwort mit GPT auf Basis CSV
 def gpt_antwort(transkript):
     try:
-        df = pd.read_csv("produktdaten.csv")
+        df = pd.read_csv("verknuepfte_tabelle_final_bereinigt.csv")
         kontext = "\n".join([f"{row['Produktname']}: {row['Status']}" for _, row in df.iterrows()])
 
         system_prompt = "Du bist ein hilfreicher Kundenservice-Assistent. Nutze die folgenden Produktdaten, um Fragen zu beantworten."
