@@ -66,8 +66,8 @@ def antwort():
         user_input = transcript_response.text.strip()
         print("User Input:", user_input)
 
-        prompt = f"Ein Kunde fragt: '{user_input}'"
-Suche in den folgenden Rechnungsdaten eine passende Antwort."
+        prompt = f"Ein Kunde fragt: '{user_input}'. Suche in den folgenden Rechnungsdaten eine passende Antwort."
+
 
         if "rechnung" in user_input.lower():
             for word in user_input.split():
