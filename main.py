@@ -23,7 +23,7 @@ def index():
 def telefon():
     response = VoiceResponse()
     response.say("Willkommen bei wowona. Mein Name ist Maria. Wie kann ich Dir helfen?", language="de-DE")
-    response.record(action="/antwort", method="POST", max_length=10, play_beep=True, transcribe=False)
+    response.record(action="/antwort", method="POST", max_length=10, play_beep=false, transcribe=False)
     return str(response)
 
 @app.route("/antwort", methods=["POST"])
