@@ -1,32 +1,30 @@
 import os
-import requests
-import pandas as pd
 from flask import Flask, request, Response
 from dotenv import load_dotenv
+import openai
+import requests
+from pydub import AudioSegment
+from io import BytesIO
 
 load_dotenv()
 
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
-from openai import OpenAI
-
-client = OpenAI(api_key=OPENAI_API_KEY)
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
 app = Flask(__name__)
 
 @app.route("/")
-def index():
-    return "Telefon-API läuft"
+def home():
+    return "Telefon-Assistent läuft"
 
 @app.route("/telefon", methods=["POST"])
 def telefon():
-    response = '''<?xml version="1.0" encoding="UTF-8"?>
+    response = """<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Say language="de-DE">Willkommen bei wowona. Mein Name ist Maria. Wie kann ich Dir helfen?</Say>
     <Record action="/antwort" maxLength="10" playBeep="false" transcribe="false" />
-</Response>'''
+</Response>"""
     return Response(response, mimetype="text/xml")
 
 @app.route("/antwort", methods=["POST"])
@@ -35,52 +33,39 @@ def antwort():
         recording_url = request.form.get("RecordingUrl")
         print("Recording URL:", recording_url)
 
+        if not recording_url:
+            raise ValueError("Keine Aufnahme-URL erhalten.")
+
         audio_response = requests.get(f"{recording_url}.wav", auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN))
 
         if audio_response.status_code != 200:
-            raise Exception(f"Error code: {audio_response.status_code} - {audio_response.json()}")
+            raise ValueError(f"Fehler beim Abrufen der Audioaufnahme: {audio_response.status_code} - {audio_response.text}")
 
-        with open("aufnahme.wav", "wb") as f:
-            f.write(audio_response.content)
+        audio = AudioSegment.from_file(BytesIO(audio_response.content), format="wav")
+        mp3_io = BytesIO()
+        audio.export(mp3_io, format="mp3")
+        mp3_io.seek(0)
 
-        with open("aufnahme.wav", "rb") as f:
-            transcript = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=f,
-                response_format="text",
-                language="de"
-            )
+        try:
+            transcript = openai.Audio.transcribe("whisper-1", mp3_io)
+            antwort = transcript.get("text", "").strip()
+            if not antwort:
+                raise ValueError("Keine Transkription erhalten.")
+        except Exception as e:
+            print(f"Transkriptionsfehler: {e}")
+            return Response("""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say language="de-DE">Leider konnte ich dich nicht verstehen. Bitte wiederhole deine Frage.</Say>
+</Response>""", mimetype="text/xml")
 
-        user_input = transcript.strip()
-
-        df = pd.read_csv("verknuepfte_tabelle_final_bereinigt.csv", sep=";")
-        prompt = f"Ein Kunde fragt: '{user_input}'\nSuche in den folgenden Rechnungsdaten eine passende Antwort."
-
-        prompt += "\n\n"
-        for index, row in df.iterrows():
-            prompt += f"Rechnungsnummer: {row['rechnungsnummer']}, Betrag: {row['betrag']}, Firma: {row['firma']}, Produkt: {row['produktbezeichnung']}\n"
-
-        prompt += "\nAntworte sehr knapp und nur auf Basis dieser Daten."
-
-        completion = client.chat.completions.create(
-            model="gpt-4",
-            messages=[
-                {"role": "user", "content": prompt}
-            ]
-        )
-
-        antwort = completion.choices[0].message.content
-
-        response = f'''<?xml version="1.0" encoding="UTF-8"?>
+        return Response(f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Say language="de-DE">{antwort}</Say>
-</Response>'''
-        return Response(response, mimetype="text/xml")
+</Response>""", mimetype="text/xml")
 
     except Exception as e:
-        print("Fehler bei der Verarbeitung:", str(e))
-        fehler_antwort = '''<?xml version="1.0" encoding="UTF-8"?>
+        print(f"Fehler bei der Verarbeitung: {e}")
+        return Response("""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Say language="de-DE">Es ist ein Fehler aufgetreten. Bitte schaue dir die Software nochmals an. ho.</Say>
-</Response>'''
-        return Response(fehler_antwort, mimetype="text/xml")
+</Response>""", mimetype="text/xml")
