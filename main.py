@@ -16,7 +16,7 @@ import urllib.request, urllib.error
 load_dotenv()
 
 # ===================== ENV =====================
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
 REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
 STREAM_WSS_PATH = os.getenv("TWILIO_STREAM_PATH", "/twilio-stream")  # Fallback
 VOICE = os.getenv("TWILIO_VOICE", "alloy")
@@ -44,7 +44,6 @@ def _classify_key(k: str) -> str:
     if k.startswith("sk-"): return "standard key (OK)"
     return "unknown"
 
-# Logge, von wo der Key kommt
 print(f"[KEY CHECK] ENV OPENAI_API_KEY: {_mask_key(OPENAI_API_KEY)} → {_classify_key(OPENAI_API_KEY)}")
 try:
     env_path = os.path.join(os.getcwd(), ".env")
@@ -135,8 +134,13 @@ class Bridge:
         # Timing/Buffering
         self.last_media_ts: float = 0.0
         self.last_commit_ts: float = 0.0
-        self.last_activity_ts: float = time.time()  # für Idle-Logik
+        self.last_activity_ts: float = time.time()  # nur Info
         self.bytes_buffered: int = 0
+
+        # Sprachdauer vor Commit
+        self.MIN_VOICED_MS = 400  # mindestens 0.4 s echte Sprache vor Commit
+        self.voiced_bytes_since_last_commit = 0
+        self.voiced_threshold_met = False  # wird True, sobald Mindestsprachdauer erreicht
 
         # Tasks/State
         self.commit_task: Optional[asyncio.Task] = None
@@ -144,28 +148,34 @@ class Bridge:
         self.closed = False
         self.seen_start = False
 
-        # Idle-Logik
-        self.IDLE_PROMPT_AFTER = 6.0     # s Schweigen → „Noch etwas?“
-        self.HANGUP_AFTER_IDLE = 10.0    # weitere s → Verabschieden + close
-        self.idle_prompt_sent = False
-
-        # Latenz-Tuning (8 kHz, μ-law ~8 kB/s)
-        self.BUFFER_BYTES_THRESHOLD = 3000   # ~0.375 s Audio bis Commit (bei μ-law ~8kB/s = 3000~0.37s)
+        # Latenz-Tuning (μ-law ~8 kB/s)
+        self.BUFFER_BYTES_THRESHOLD = 3000   # ~0.375 s Audio bis Commit
         self.FORCE_COMMIT_INTERVAL = 0.7     # spätestens nach 0.7 s committen
         self.SILENCE_COMMIT_GAP = 0.18       # ~180 ms Pause = Commit
 
+        # Idle-Features bewusst deaktiviert (KI wartet auf echte Sprache)
+        self.IDLE_PROMPT_AFTER = None
+        self.HANGUP_AFTER_IDLE = None
+        self.idle_prompt_sent = False
+
     async def open_openai(self):
         url = f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}"
-        headers = {
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "OpenAI-Beta": "realtime=v1",
-        }
+        # Verwende offizielles Subprotocol + Auth-Header
+        headers = [("Authorization", f"Bearer {OPENAI_API_KEY}")]
+        subprotocols = ["openai-beta.realtime.v1"]
+
         if not OPENAI_API_KEY or not OPENAI_API_KEY.startswith("sk-"):
             print("⚠️  OPENAI_API_KEY fehlt/ungültig. Bitte Environment prüfen.")
         try:
             print("OAI: connecting →", url)
+            print("OAI: using subprotocols:", subprotocols, " | auth header present:", bool(OPENAI_API_KEY))
             self.oai_ws = await asyncio.wait_for(
-                websockets.connect(url, extra_headers=headers, ping_interval=20),
+                websockets.connect(
+                    url,
+                    extra_headers=headers,
+                    subprotocols=subprotocols,
+                    ping_interval=20
+                ),
                 timeout=5.0
             )
             print("OAI: connected")
@@ -175,7 +185,7 @@ class Bridge:
                     "instructions": SYSTEM_PROMPT,
                     "modalities": ["audio", "text"],
                     "voice": VOICE,
-                    # *** μ-law Passthrough (8 kHz) ***
+                    # μ-law passthrough (8 kHz)
                     "input_audio_format": "g711_ulaw",
                     "output_audio_format": "g711_ulaw",
                 },
@@ -208,54 +218,41 @@ class Bridge:
             if self.playing_audio:
                 continue
 
-            # (1) Commit bei ~180 ms Stille (nur wenn wir zuvor Audio gesammelt haben)
-            if self.last_media_ts and (now - self.last_media_ts > self.SILENCE_COMMIT_GAP) and self.bytes_buffered > 0:
+            # Nur committen, wenn Mindestsprachdauer erreicht wurde
+            min_voiced_bytes = int(self.MIN_VOICED_MS * 8)  # μ-law ≈ 1 byte pro Sample @8kHz → ~8 Bytes/ms
+            if self.voiced_bytes_since_last_commit >= min_voiced_bytes:
+                self.voiced_threshold_met = True
+
+            # (1) Commit bei ~180 ms Stille, NUR wenn Sprachschwelle erreicht
+            if (
+                self.voiced_threshold_met
+                and self.last_media_ts
+                and (now - self.last_media_ts > self.SILENCE_COMMIT_GAP)
+                and self.bytes_buffered > 0
+            ):
                 print("Auto-commit (silence): committing after ~180ms pause")
                 await self._commit_and_request_response()
-                self.bytes_buffered = 0
-                self.last_commit_ts = now
-                self.last_media_ts = 0.0
+                self._reset_after_commit(now)
                 continue
 
-            # (2) Spätestens nach 0.7 s committen, wenn genug Audio gesammelt
-            if self.bytes_buffered >= self.BUFFER_BYTES_THRESHOLD and (now - self.last_commit_ts) >= self.FORCE_COMMIT_INTERVAL:
+            # (2) Spätestens nach 0.7 s committen, falls genug gepuffert UND Sprachschwelle erreicht
+            if (
+                self.voiced_threshold_met
+                and self.bytes_buffered >= self.BUFFER_BYTES_THRESHOLD
+                and (now - self.last_commit_ts) >= self.FORCE_COMMIT_INTERVAL
+            ):
                 print(f"Auto-commit (force): bytes_buffered={self.bytes_buffered}, dt={now - self.last_commit_ts:.2f}s")
                 await self._commit_and_request_response()
-                self.bytes_buffered = 0
-                self.last_commit_ts = now
+                self._reset_after_commit(now)
 
-            # (3) Idle-Überwachung (nur wenn KI NICHT spricht)
-            idle_for = now - self.last_activity_ts
-            if idle_for >= self.IDLE_PROMPT_AFTER and not self.idle_prompt_sent:
-                try:
-                    await self.oai_ws.send(json.dumps({
-                        "type": "response.create",
-                        "response": {
-                            "modalities": ["audio", "text"],
-                            "instructions": "Möchten Sie noch etwas wissen?"
-                        }
-                    }))
-                    print("OAI: idle prompt sent")
-                    self.idle_prompt_sent = True
-                    self.last_activity_ts = now  # Timer neu starten
-                except Exception as e:
-                    print("OAI idle prompt error:", repr(e))
+            # Keine Idle-Automatik: KI bleibt still und wartet auf Sprache
 
-            elif self.idle_prompt_sent and idle_for >= (self.IDLE_PROMPT_AFTER + self.HANGUP_AFTER_IDLE):
-                try:
-                    await self.oai_ws.send(json.dumps({
-                        "type": "response.create",
-                        "response": {
-                            "modalities": ["audio", "text"],
-                            "instructions": "Danke für Ihren Anruf. Auf Wiederhören!"
-                        }
-                    }))
-                    print("OAI: goodbye sent; closing bridge soon")
-                except Exception as e:
-                    print("OAI goodbye error:", repr(e))
-                await asyncio.sleep(1.0)
-                await self.close()
-                return
+    def _reset_after_commit(self, now: float):
+        self.bytes_buffered = 0
+        self.voiced_bytes_since_last_commit = 0
+        self.voiced_threshold_met = False
+        self.last_commit_ts = now
+        self.last_media_ts = 0.0
 
     async def _commit_and_request_response(self):
         if not self.oai_ws:
@@ -312,7 +309,7 @@ class Bridge:
                         print("OAI proactive greeting error:", repr(e))
 
                 elif event == "media":
-                    # Wenn die KI gerade spricht → eingehendes Audio ignorieren (verhindert Endlosschleifen)
+                    # Während die KI spricht → eingehendes Audio ignorieren (verhindert Echo/Übersprechen)
                     if self.playing_audio:
                         self.last_media_ts = time.time()
                         continue
@@ -320,8 +317,7 @@ class Bridge:
                     ulaw_b64 = data["media"]["payload"]
                     ulaw = base64.b64decode(ulaw_b64)
 
-                    # OPTIONAL: VAD – nur zur Prüfung kurz nach PCM16 decodieren
-                    # (Audiofluss bleibt μ-law Passthrough)
+                    # OPTIONAL: VAD (prüfe kurz in PCM16, Audiofluss bleibt μ-law)
                     if not is_voice_pcm16(ulaw_decode_bytes(ulaw), threshold=600.0):
                         self.last_media_ts = time.time()
                         continue
@@ -335,16 +331,17 @@ class Bridge:
 
                     # Buffer-Tracking
                     self.bytes_buffered += len(ulaw)
+                    self.voiced_bytes_since_last_commit += len(ulaw)  # gezählt nur bei Stimme
                     self.last_media_ts = time.time()
                     self.last_activity_ts = time.time()
                     self.idle_prompt_sent = False
 
                 elif event == "stop":
                     print("Twilio stop")
-                    if self.bytes_buffered > 0 and not self.playing_audio:
+                    # Kein erzwungener Commit am Ende, wenn Sprachschwelle nicht erreicht wurde
+                    if self.bytes_buffered > 0 and self.voiced_threshold_met and not self.playing_audio:
                         await self._commit_and_request_response()
-                        self.bytes_buffered = 0
-                        self.last_commit_ts = time.time()
+                        self._reset_after_commit(time.time())
                     break
 
         except WebSocketDisconnect:
@@ -389,6 +386,10 @@ class Bridge:
                             "mark": {"name": "assistant_turn_done"},
                         })
                         self.playing_audio = False
+                        # Nach Ende der KI-Antwort: Reset der Voice-Schwelle,
+                        # damit deine nächste Antwort wieder 0.4s sammeln muss
+                        self.voiced_bytes_since_last_commit = 0
+                        self.voiced_threshold_met = False
                         self.last_activity_ts = time.time()
                         self.idle_prompt_sent = False
 
