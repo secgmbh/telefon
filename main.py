@@ -17,7 +17,7 @@ load_dotenv()
 OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
 REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
 STREAM_WSS_PATH = os.getenv("TWILIO_STREAM_PATH", "/twilio-stream")
-VOICE = os.getenv("TWILIO_VOICE", "alloy")
+VOICE = os.getenv("TWILIO_VOICE", "verse")  # verse ist stabil
 SYSTEM_PROMPT = os.getenv(
     "REALTIME_SYSTEM_PROMPT",
     "Du bist Maria, eine freundliche, präzise deutschsprachige Assistentin. "
@@ -60,7 +60,6 @@ async def telefon_live(request: Request):
     try:
         wss_url = str(request.url_for("twilio_stream")).replace("http", "wss", 1)
     except Exception:
-        # Fallback falls Router-Name nicht gefunden → auf Basis der Base-URL bauen
         base = str(request.base_url).rstrip("/")
         wss_url = base.replace("http", "wss", 1) + STREAM_WSS_PATH
 
@@ -115,25 +114,24 @@ class Bridge:
         )
         print("OAI: connected (negotiated subprotocol:", getattr(self.oai_ws, "subprotocol", None), ")")
 
-        # ⚠️ Minimal gültiges session.update (alles andere kann invalid_value auslösen)
+        # ⚠️ Minimal gültiges session.update (keine modalities hier!)
         await self.oai_ws.send(json.dumps({
             "type": "session.update",
             "session": {
                 "instructions": SYSTEM_PROMPT,
-                "modalities": ["audio", "text"],
                 "voice": VOICE,
                 "input_audio_format": "g711_ulaw",
-                "output_audio_format": "g711_ulaw",
+                "output_audio_format": "g711_ulaw"
             }
         }))
-        print("OAI: session.update sent (μ-law)")
+        print("OAI: session.update sent (μ-law, minimal)")
 
-        # Proaktiver Gruß
+        # Proaktiver Gruß (minimal)
         await self.oai_ws.send(json.dumps({
             "type": "response.create",
             "response": {
-                "modalities": ["audio", "text"],
                 "instructions": GREETING,
+                "modalities": ["audio"]
             }
         }))
         print("OAI: proactive greeting response.create sent")
@@ -141,7 +139,7 @@ class Bridge:
     # ----------------- Start Bridge -----------------
     async def start(self):
         await self.open_openai()
-        # Starte beide Richtungen
+        # Starte beide Richtungen + Auto-Commit
         await asyncio.gather(
             self._pipe_twilio_to_openai(),
             self._pipe_openai_to_twilio(),
@@ -171,7 +169,7 @@ class Bridge:
                     self.last_commit_ts = time.time()
 
                 elif event == "media":
-                    # Während die KI spricht, puffern wir nicht (Echo vermeiden)
+                    # Während die KI spricht, Audio-Eingang ignorieren (Echo vermeiden)
                     if self.playing_audio:
                         continue
                     b64_ulaw = data["media"]["payload"]
@@ -252,7 +250,7 @@ class Bridge:
                 now = time.time()
                 if self.playing_audio:
                     continue
-                # nur committen, wenn wir seit letztem Commit überhaupt was gesammelt haben
+                # nur committen, wenn seit letztem Commit überhaupt was gesammelt wurde
                 if self.bytes_since_commit == 0:
                     continue
                 # Stillefenster
@@ -269,7 +267,12 @@ class Bridge:
     async def _commit_and_request(self):
         try:
             await self.oai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-            await self.oai_ws.send(json.dumps({"type": "response.create", "response": {"modalities": ["audio", "text"]}}))
+            await self.oai_ws.send(json.dumps({
+                "type": "response.create",
+                "response": {
+                    "modalities": ["audio"]
+                }
+            }))
             self.last_commit_ts = time.time()
             self.bytes_since_commit = 0
             print("OAI: commit + response.create sent")
