@@ -14,121 +14,53 @@ OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-mini-tran
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 PORT = int(os.getenv("PORT", 10000))
+REPLY_STYLE = os.getenv("REPLY_STYLE", "du")  # "du" | "sie"
+MAX_TURNS = int(os.getenv("MAX_TURNS", "4"))
+VOICE = os.getenv("TWILIO_VOICE", "Polly.Vicki-Neural")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
-
 app = Flask(__name__)
 
+# Simpler In-Memory-Zustand pro CallSid
+CALL_STATE = {}  # { CallSid: {"turn": int} }
 
-@app.route("/", methods=["GET"])
-def index():
-    return "OK"
+# ------- Hilfen -------
 
-
-# 1) Anruf-Start: Begrüßung + Aufnahme
-@app.route("/telefon", methods=["POST"])
-def telefon():
-    response = """<?xml version="1.0" encoding="UTF-8"?>
-    <Response>
-        <Say language="de-DE" voice="Polly.Vicki-Neural">
-            Willkommen bei wowona. Mein Name ist Maria. Wie kann ich Dir helfen?
-        </Say>
-        <Record action="/antwort" method="POST" maxLength="20" timeout="2"
-                finishOnKey="#" trim="trim-silence"
-                playBeep="false" transcribe="false" />
-    </Response>"""
-    return Response(response, mimetype="text/xml")
-
-
-# 2) Nach der Aufnahme: WAV holen → OpenAI transkribieren → direkte KI-Antwort
-@app.route("/antwort", methods=["POST"])
-def antwort():
-    try:
-        recording_url = request.form.get("RecordingUrl")
-        if not recording_url:
-            return twilio_response("Es wurde keine Aufnahme übermittelt.")
-
-        wav_url = recording_url + ".wav"
-
-        # Kurzer Retry, falls Twilio noch nicht fertig gespeichert hat
-        content = None
-        for _ in range(6):  # bis ~1.2s bei 0.2s Sleep
-            r = requests.get(
-                wav_url,
-                auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
-                timeout=10,
-            )
-            if r.status_code == 200 and int(r.headers.get("Content-Length", 0)) > 0:
-                content = r.content
-                break
-            time.sleep(0.2)
-        if content is None:
-            r = requests.get(
-                wav_url,
-                auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
-                timeout=10,
-            )
-            r.raise_for_status()
-            content = r.content
-
-        print("WAV Bytes:", len(content))
-
-        # --- Transkription (In-Memory) ---
-        file_like = io.BytesIO(content)
-        file_like.name = "recording.wav"
-
-        tr = client.audio.transcriptions.create(
-            model=OPENAI_TRANSCRIBE_MODEL,
-            file=file_like,
-            language="de",
-        )
-        transcript = getattr(tr, "text", None) or (
-            tr.get("text") if isinstance(tr, dict) else ""
-        )
-        print("Transkript:", transcript)
-
-        # --- Direkte Antwort ---
-        reply_style = os.getenv("REPLY_STYLE", "du")  # "du" | "sie"
-        tone = "freundlich, klar, lösungsorientiert"
-        addr = "du" if reply_style.lower() == "du" else "Sie"
-
-        prompt = (
-            "Antworte direkt auf das Anliegen des Anrufers in natürlichem Deutsch (Anrede: {addr}). "
-            "Ziel: eine hilfreiche, konkrete Antwort mit ggf. 1-2 gezielten Rückfragen, keine Zusammenfassung. "
-            "Sei {tone}. Wenn Informationen fehlen, frage präzise nach. Halte dich an 1-3 Sätze, außer es werden konkrete Schritte verlangt.\n\n"
-            "Gesagter Inhalt (Roh-Transkript): {transcript}"
-        ).format(addr=addr, tone=tone, transcript=transcript)
-
-        resp = client.responses.create(
-            model="gpt-4o-mini",
-            input=[{"role": "user", "content": prompt}],
-        )
-        bot_text = (
-            extract_text(resp)
-            or "Danke dir! Kannst du bitte kurz präzisieren, wobei ich dir genau helfen soll?"
-        )
-
-        return twilio_response(bot_text)
-
-    except Exception as e:
-        print("Fehler bei der Verarbeitung:", e)
-        return twilio_response(
-            "Es ist ein Fehler aufgetreten bei der Verarbeitung der Aufnahme."
-        )
-
-
-# ====== Hilfen ======
-def twilio_response(text: str, *, voice: str = "Polly.Vicki-Neural") -> Response:
-    return Response(
-        f"""<?xml version="1.0" encoding="UTF-8"?>
-    <Response>
-        <Say language="de-DE" voice="{voice}">{escape_xml(text)}</Say>
-    </Response>""",
-        mimetype="text/xml",
+def twiml_say(text, voice=VOICE):
+    return '<Say language="de-DE" voice="{voice}">{text}</Say>'.format(
+        voice=voice, text=escape_xml(text)
     )
 
+def twiml_record(action="/antwort", max_len="20", timeout="2", beep="false"):
+    # finishOnKey="#" => User kann mit Raute sofort abschließen
+    return (
+        '<Record action="{action}" method="POST" maxLength="{ml}" timeout="{to}" '
+        'finishOnKey="#" trim="trim-silence" playBeep="{beep}" transcribe="false" />'
+    ).format(action=action, ml=max_len, to=timeout, beep=beep)
 
-def escape_xml(s: str) -> str:
+def end_conversation_twiML(final_text):
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        + twiml_say(final_text)
+        + "</Response>"
+    )
+    return Response(xml, mimetype="text/xml")
+
+def continue_conversation_twiML(bot_text, followup_hint="Wenn du fertig bist, drücke die Raute."):
+    # Antwort + erneute Aufnahme (Loop)
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        + twiml_say(bot_text)
+        + '<Pause length="1"/>'
+        + twiml_say(followup_hint)
+        + twiml_record()
+        + "</Response>"
+    )
+    return Response(xml, mimetype="text/xml")
+
+def escape_xml(s):
     return (
         s.replace("&", "&amp;")
         .replace("<", "&lt;")
@@ -137,8 +69,7 @@ def escape_xml(s: str) -> str:
         .replace("'", "&apos;")
     )
 
-
-def extract_text(response_obj) -> str:
+def extract_text(response_obj):
     try:
         if hasattr(response_obj, "output_text"):
             return response_obj.output_text
@@ -154,6 +85,106 @@ def extract_text(response_obj) -> str:
         pass
     return ""
 
+def should_end(user_text, turns, max_turns):
+    if turns >= max_turns:
+        return True
+    if not user_text:
+        return False  # leeres/unklares Audio -> noch eine Runde probieren
+    t = user_text.lower()
+    endings = ["nein danke", "nein, danke", "danke, das war's", "das wars", "tschüss", "auf wiedersehen", "passt so", "alles gut", "fertig"]
+    return any(phrase in t for phrase in endings)
 
+# ------- Routes -------
+
+@app.route("/", methods=["GET"])
+def index():
+    return "OK"
+
+@app.route("/telefon", methods=["POST"])
+def telefon():
+    # Einstieg: Begrüßung + erste Aufnahme
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        + twiml_say("Willkommen bei wowona. Mein Name ist Petra. Wie kann ich dir helfen?")
+        + twiml_record()
+        + "</Response>"
+    )
+    return Response(xml, mimetype="text/xml")
+
+@app.route("/antwort", methods=["POST"])
+def antwort():
+    try:
+        call_sid = request.form.get("CallSid", "")
+        state = CALL_STATE.get(call_sid, {"turn": 0})
+        state["turn"] = int(state.get("turn", 0)) + 1
+        CALL_STATE[call_sid] = state
+
+        recording_url = request.form.get("RecordingUrl")
+        if not recording_url:
+            # Kein Audio? Frage nochmal.
+            return continue_conversation_twiML(
+                "Ich habe dich leider nicht verstanden. Kannst du dein Anliegen bitte noch einmal kurz schildern?"
+            )
+
+        # --- schneller: WAV statt MP3 ---
+        wav_url = recording_url + ".wav"
+
+        # Kurzer Retry, falls Twilio noch nicht fertig gespeichert hat
+        content = None
+        for _ in range(6):  # ~1.2s
+            r = requests.get(wav_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), timeout=10)
+            if r.status_code == 200 and int(r.headers.get("Content-Length", 0)) > 0:
+                content = r.content
+                break
+            time.sleep(0.2)
+        if content is None:
+            r = requests.get(wav_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), timeout=10)
+            r.raise_for_status()
+            content = r.content
+
+        # Transkription (In-Memory)
+        file_like = io.BytesIO(content)
+        file_like.name = "recording.wav"
+        tr = client.audio.transcriptions.create(
+            model=OPENAI_TRANSCRIBE_MODEL,
+            file=file_like,
+            language="de",
+        )
+        transcript = getattr(tr, "text", None) or (tr.get("text") if isinstance(tr, dict) else "")
+        print("TURN", state["turn"], "TRANSCRIPT:", transcript)
+
+        # Direkte Antwort
+        addr = "du" if REPLY_STYLE.lower() == "du" else "Sie"
+        tone = "freundlich, klar, lösungsorientiert"
+        prompt = (
+            "Antworte direkt auf das Anliegen des Anrufers in natürlichem Deutsch (Anrede: {addr}). "
+            "Ziel: eine hilfreiche, konkrete Antwort mit ggf. 1-2 gezielten Rückfragen, keine Zusammenfassung. "
+            "Sei {tone}. Wenn Informationen fehlen, frage präzise nach. Halte dich an 1-3 Sätze, außer es werden konkrete Schritte verlangt.\n\n"
+            "Gesagter Inhalt (Roh-Transkript): {transcript}"
+        ).format(addr=addr, tone=tone, transcript=transcript)
+
+        resp = client.responses.create(model="gpt-4o-mini", input=[{"role": "user", "content": prompt}])
+        bot_text = extract_text(resp) or "Kannst du mir das bitte noch etwas genauer erklären, damit ich gezielt helfen kann?"
+
+        # Abbruch-Logik
+        if should_end(transcript, state["turn"], MAX_TURNS):
+            # Aufräumen
+            try:
+                del CALL_STATE[call_sid]
+            except Exception:
+                pass
+            return end_conversation_twiML(bot_text + " Danke für den Anruf und einen schönen Tag!")
+
+        # Weiterfragen (Loop)
+        # Kleiner Hinweis zur Steuerung am Telefon:
+        followup_hint = "Wenn du fertig bist, drücke die Raute."
+        return continue_conversation_twiML(bot_text, followup_hint)
+
+    except Exception as e:
+        print("Fehler bei der Verarbeitung:", e)
+        return end_conversation_twiML("Es ist ein Fehler aufgetreten bei der Verarbeitung. Vielen Dank für deinen Anruf.")
+
+# ------- Main -------
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=PORT)
