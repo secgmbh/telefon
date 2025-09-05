@@ -1,7 +1,14 @@
 services:
   - type: web
-    name: telefon-assistent
+    name: telefon-qb6i
     env: python
+    region: frankfurt
+    autoDeploy: false
+    healthCheckPath: /healthz
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn main:app
-    plan: free
+    startCommand: gunicorn -k uvicorn.workers.UvicornWorker main:app
+    envVars:
+      - key: WEB_CONCURRENCY
+        value: "1"
+      - key: OPENAI_API_KEY
+        sync: false
