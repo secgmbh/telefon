@@ -260,10 +260,10 @@ class CallSession:
                         if delta:
                             self.assistant_speaking = True
                             print("OpenAI audio delta", len(delta))
-                            await self.twilio_ws.send_text(json.dumps({"event": "media", "media": {"payload": delta}}))
+                            await self.twilio_ws.send_text(json.dumps({"event": "media", "streamSid": self.twilio_stream_sid, "media": {"payload": delta}}))
                     elif t == "response.completed":
                         self.assistant_speaking = False
-                        await self.twilio_ws.send_text(json.dumps({"event": "mark", "mark": {"name": "oai_response_end"}}))
+                        await self.twilio_ws.send_text(json.dumps({"event": "mark", "streamSid": self.twilio_stream_sid, "mark": {"name": "oai_response_end"}}))
                     elif t == "response.cancelled":
                         self.assistant_speaking = False
                     elif t == "error":
