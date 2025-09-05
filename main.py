@@ -260,15 +260,22 @@ class CallSession:
 
 @app.websocket("/media-stream")
 async def media_stream(ws: WebSocket):
-    await ws.accept()
+    # Accept Twilio's 'audio' subprotocol for media streams
+    try:
+        requested = ws.headers.get('sec-websocket-protocol')
+    except Exception:
+        requested = None
+    print("WS handshake: client requested subprotocol:", requested)
+    await ws.accept(subprotocol="audio")
     session = CallSession(ws)
     try:
         await session.run()
     finally:
         try:
             await ws.close()
-        except Exception:
-            pass
+            print("WS closed")
+        except Exception as e:
+            print("WS close error:", e)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5050"))
