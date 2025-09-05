@@ -37,6 +37,11 @@ async def incoming_call():
 </Response>"""
     return HTMLResponse(content=twiml, media_type="application/xml")
 
+@app.post("/telefon_live")
+async def telefon_live():
+    # Alias-Endpoint für bestehende Twilio-Konfigurationen
+    return await incoming_call()
+
 
 class CallSession:
     """
@@ -52,6 +57,8 @@ class CallSession:
         self.twilio_ws = twilio_ws
         self.oai_ws: Optional[websockets.WebSocketClientProtocol] = None
         self.closed = False
+        self.oai_ready = False
+        self.twilio_stream_sid = None
 
     async def _connect_openai(self):
         url = "wss://api.openai.com/v1/realtime?model=gpt-realtime"
@@ -117,13 +124,22 @@ class CallSession:
                 event = data.get("event")
 
                 if event == "start":
-                    # Twilio stream started
-                    pass
+                    info = data.get("start", {})
+                    self.twilio_stream_sid = info.get("streamSid")
+                
                 elif event == "media":
+                    if not self.oai_ready:
+                        # Drop audio until OpenAI session is updated
+                        continue
                     media = data.get("media", {})
                     payload = media.get("payload")
                     if payload:
-                        await self._oai_send_audio_chunk(payload)
+                        try:
+                            await self._oai_send_audio_chunk(payload)
+                        except Exception as e:
+                            # Socket probably closed; mark session
+                            self.closed = True
+                            break
                 elif event == "mark":
                     # Use marks to force commit
                     await self._oai_finish_input()
@@ -144,7 +160,9 @@ class CallSession:
                     continue
                 mtype = evt.get("type")
 
-                if mtype == "response.output_audio.delta":
+                if mtype == "session.updated":
+                    self.oai_ready = True
+                elif mtype == "response.output_audio.delta":
                     # New GA event field name: 'delta' (base64 μ-law chunk)
                     delta = evt.get("delta")
                     if delta:
@@ -158,7 +176,6 @@ class CallSession:
                         "event": "mark", "mark": {"name": "oai_response_end"}
                     }))
                 elif mtype == "error":
-                    # Log/forward an error as a say event (optional)
                     err = evt.get("error", {})
                     print("OpenAI error:", err)
         except Exception as e:
