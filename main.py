@@ -93,7 +93,7 @@ def telefon():
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
         + twiml_say("Willkommen bei wowona. Mein Name ist Petra. Wie kann ich dir helfen?")
-        + twiml_record()  # maxLength=15s, timeout=1s Stille
+        + twiml_record()  # maxLength=3s, timeout=1s Stille
         + "</Response>"
     )
     return Response(xml, mimetype="text/xml")
