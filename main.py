@@ -75,9 +75,10 @@ def antwort():
         reply_style = os.getenv("REPLY_STYLE", "du")  # "du" | "sie"
         tone = "freundlich, klar, lösungsorientiert"
         addr = "du" if reply_style.lower() == "du" else "Sie"
-        prompt = (
-            (
-            f"Antworte direkt auf das Anliegen des Anrufers in natürlichem Deutsch (Anrede: {addr}). "
+        prompt = ("Antworte direkt auf das Anliegen des Anrufers in natürlichem Deutsch (Anrede: {} ). ".format(addr)
+            + "Ziel: eine hilfreiche, konkrete Antwort mit ggf. 1-2 gezielten Rückfragen, keine Zusammenfassung. "
+            + "Sei {}. Wenn Informationen fehlen, frage präzise nach. Halte dich an 1-3 Sätze, außer es werden konkrete Schritte verlangt.\n\n".format(tone)
+            + "Gesagter Inhalt (Roh-Transkript): {}".format(transcript)). "
             f"Ziel: eine hilfreiche, konkrete Antwort mit ggf. 1-2 gezielten Rückfragen, keine Zusammenfassung. "
             f"Sei {tone}. Wenn Informationen fehlen, frage präzise nach. Halte dich an 1-3 Sätze, außer es werden konkrete Schritte verlangt.
 
@@ -131,8 +132,10 @@ def antwort():
         reply_style = os.getenv("REPLY_STYLE", "du")  # "du" | "sie"
         tone = "freundlich, klar, lösungsorientiert"
         addr = "du" if reply_style.lower() == "du" else "Sie"
-        prompt = (
-            f"Antworte direkt auf das Anliegen des Anrufers in natürlichem Deutsch (Anrede: {addr}). "
+        prompt = ("Antworte direkt auf das Anliegen des Anrufers in natürlichem Deutsch (Anrede: {} ). ".format(addr)
+            + "Ziel: eine hilfreiche, konkrete Antwort mit ggf. 1-2 gezielten Rückfragen, keine Zusammenfassung. "
+            + "Sei {}. Wenn Informationen fehlen, frage präzise nach. Halte dich an 1-3 Sätze, außer es werden konkrete Schritte verlangt.\n\n".format(tone)
+            + "Gesagter Inhalt (Roh-Transkript): {}".format(transcript)). "
             f"Ziel: eine hilfreiche, konkrete Antwort mit ggf. 1-2 gezielten Rückfragen, keine Zusammenfassung. "
             f"Sei {tone}. Wenn Informationen fehlen, frage präzise nach. "
             f"Halte dich an 1-3 Sätze, außer es werden konkrete Schritte verlangt.\n\n"
