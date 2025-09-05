@@ -17,7 +17,7 @@ load_dotenv()
 OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
 REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
 STREAM_WSS_PATH = os.getenv("TWILIO_STREAM_PATH", "/twilio-stream")
-VOICE = os.getenv("TWILIO_VOICE", "verse")  # verse ist stabil
+VOICE = os.getenv("TWILIO_VOICE", "verse")  # verse = stabil
 SYSTEM_PROMPT = os.getenv(
     "REALTIME_SYSTEM_PROMPT",
     "Du bist Maria, eine freundliche, präzise deutschsprachige Assistentin. "
@@ -56,7 +56,7 @@ async def index():
 # -------------------------------------------------
 @app.api_route("/telefon_live", methods=["GET", "POST"])
 async def telefon_live(request: Request):
-    # Robuste WSS-URL-Erzeugung (Fix für TypeError)
+    # Robuste WSS-URL-Erzeugung
     try:
         wss_url = str(request.url_for("twilio_stream")).replace("http", "wss", 1)
     except Exception:
@@ -85,7 +85,7 @@ class Bridge:
         self.playing_audio = False
         self.closed = False
 
-        # Einfaches Auto-Commit: wenn ~180ms keine eingehenden Media-Pakete → commit
+        # Auto-Commit: wenn ~180ms keine Media-Pakete → commit
         self.last_media_ts = 0.0
         self.silence_gap_sec = 0.18
         self.force_interval_sec = 0.8
@@ -96,12 +96,12 @@ class Bridge:
     async def open_openai(self):
         url = f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}"
 
-        # ✅ Korrekte Beta-Header + beide Subprotocols anbieten
+        # ✅ Korrekte Beta-Header + nur das Standard-Subprotokoll
         headers = [
             ("Authorization", f"Bearer {OPENAI_API_KEY}"),
-            ("OpenAI-Beta", "realtime-v1"),
+            ("OpenAI-Beta", "openai-beta.realtime-v1"),
         ]
-        subprotocols = ["realtime", "openai-beta.realtime.v1"]
+        subprotocols = ["realtime"]
 
         print("OAI: connecting →", url)
         print("OAI: offering subprotocols:", subprotocols, "| auth header present:", bool(OPENAI_API_KEY))
@@ -114,7 +114,7 @@ class Bridge:
         )
         print("OAI: connected (negotiated subprotocol:", getattr(self.oai_ws, "subprotocol", None), ")")
 
-        # ⚠️ Minimal gültiges session.update (keine modalities hier!)
+        # ⚠️ Minimal gültiges session.update (keine modalities hier)
         await self.oai_ws.send(json.dumps({
             "type": "session.update",
             "session": {
@@ -150,10 +150,9 @@ class Bridge:
     async def _pipe_twilio_to_openai(self):
         try:
             while True:
-                # Twilio sendet Text-Frames (JSON)
                 raw = await self.twilio_ws.receive_text()
-                if len(raw) > 140:
-                    print("WS RX (truncated):", raw[:140], "…")
+                if len(raw) > 160:
+                    print("WS RX (truncated):", raw[:160], "…")
                 else:
                     print("WS RX:", raw)
 
@@ -169,14 +168,13 @@ class Bridge:
                     self.last_commit_ts = time.time()
 
                 elif event == "media":
-                    # Während die KI spricht, Audio-Eingang ignorieren (Echo vermeiden)
+                    # Echo vermeiden: während KI spricht, nicht in den Eingabepuffer schreiben
                     if self.playing_audio:
                         continue
                     b64_ulaw = data["media"]["payload"]
                     self.last_media_ts = time.time()
                     self.bytes_since_commit += len(b64_ulaw)
 
-                    # μ-law Base64 direkt an OpenAI anhängen
                     await self.oai_ws.send(json.dumps({
                         "type": "input_audio_buffer.append",
                         "audio": b64_ulaw
@@ -184,7 +182,6 @@ class Bridge:
 
                 elif event == "stop":
                     print("Twilio stop")
-                    # Final commit & response
                     await self._commit_and_request()
                     break
 
@@ -223,7 +220,6 @@ class Bridge:
 
                 elif t in ("response.audio.done", "response.output_audio.done"):
                     print("OAI → audio done")
-                    # Mark für Twilio (optional)
                     if self.stream_sid:
                         await self._twilio_send({
                             "event": "mark",
@@ -231,7 +227,6 @@ class Bridge:
                             "mark": {"name": "assistant_turn_done"}
                         })
                     self.playing_audio = False
-                    # nach einer KI-Antwort neuen Turn beginnen → Bytes-Zähler zurücksetzen
                     self.bytes_since_commit = 0
 
                 elif t and t.startswith("error"):
@@ -241,23 +236,19 @@ class Bridge:
             print("OAI pipe error:", repr(e))
             traceback.print_exc()
 
-    # ----------------- Auto-Commit (einfache Stilleerkennung) -----------------
+    # ----------------- Auto-Commit (Stilleerkennung) -----------------
     async def _auto_commit_loop(self):
-        # Commit bei ~180ms Stille oder spätestens alle ~0.8s, sofern wir zuletzt Audio empfangen haben
         try:
             while not self.closed:
                 await asyncio.sleep(0.05)
                 now = time.time()
                 if self.playing_audio:
                     continue
-                # nur committen, wenn seit letztem Commit überhaupt was gesammelt wurde
                 if self.bytes_since_commit == 0:
                     continue
-                # Stillefenster
                 if self.last_media_ts and (now - self.last_media_ts) > self.silence_gap_sec:
                     print("Auto-commit (silence) → commit + response.create")
                     await self._commit_and_request()
-                # Hard-Intervall
                 elif (now - self.last_commit_ts) > self.force_interval_sec:
                     print("Auto-commit (force) → commit + response.create")
                     await self._commit_and_request()
