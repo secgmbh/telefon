@@ -73,11 +73,11 @@ async def diag():
 # ===== TwiML helpers =====
 def _twiml(ws_url: str, greeting: Optional[str], status_cb: str) -> str:
     say = f'<Say language="de-DE">{greeting}</Say>\n  ' if greeting else ""
-    # statusCallback hilft zu erkennen, warum Twilio evtl. nicht verbindet
+    # WICHTIG: track="inbound_track" (Twilio-Fehler 31941 vermeiden)
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   {say}<Connect>
-    <Stream url="{ws_url}" track="both" statusCallback="{status_cb}" statusCallbackMethod="POST"/>
+    <Stream url="{ws_url}" track="inbound_track" statusCallback="{status_cb}" statusCallbackMethod="POST"/>
   </Connect>
 </Response>"""
 
@@ -114,7 +114,7 @@ async def telefon_live(request: Request):
 
 @app.api_route("/stream-status", methods=["POST", "GET"])
 async def stream_status(request: Request):
-    # Twilio schickt x-www-form-urlencoded
+    # Twilio schickt x-www-form-urlencoded; loggen für Debug
     try:
         form = await request.form()
         payload = dict(form)
