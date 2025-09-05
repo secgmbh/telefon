@@ -8,6 +8,8 @@ from typing import Optional
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, PlainTextResponse
 import uvicorn
+import aiohttp
+import time
 import websockets
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
@@ -23,6 +25,7 @@ if not OPENAI_API_KEY:
 
 # ===== FastAPI app =====
 app = FastAPI(title="Twilio ↔ OpenAI Realtime Bridge (GA)")
+TWIML_GREETING = os.environ.get("TWIML_GREETING", "Willkommen bei Wowona Live. Einen Moment, ich verbinde Sie mit dem Assistenten.")
 
 @app.get("/healthz")
 async def healthz():
@@ -46,7 +49,7 @@ async def incoming_call():
     stream_ws_url = os.environ.get("STREAM_WS_URL", "wss://your-domain.example/media-stream")
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say>Willkommen bei Wowona Live. Einen Moment, ich verbinde Sie mit dem Assistenten.</Say>
+  <Say>{TWIML_GREETING}</Say>
   <Connect>
     <Stream url="{stream_ws_url}"/>
   </Connect>
@@ -78,6 +81,9 @@ class CallSession:
         self.assistant_speaking = False
         self.last_assistant_item_id = None
         self._barge_in_triggered = False
+        self._text_buf = []
+        self.user_speaking = False
+        self._last_media_ts = 0.0
 
     async def _connect_openai(self):
         url = "wss://api.openai.com/v1/realtime?model=gpt-realtime"
@@ -96,7 +102,7 @@ class CallSession:
             "session": {
                 "type": "realtime",
                 "model": OPENAI_REALTIME_MODEL,
-                "output_modalities": ["audio"],
+                "output_modalities": ["text"] if USE_AZURE_TTS else ["audio"],
                 "instructions": (
                     REALTIME_SYSTEM_PROMPT
                 ),
@@ -114,11 +120,7 @@ class CallSession:
             }
         }
         await self._oai_send_json(session_update)
-
-        # Optional: send a short greeting proactively
-        await self._oai_send_json({"type": "response.create"})
-
-    async def _oai_send_json(self, payload: dict):
+async def _oai_send_json(self, payload: dict):
         assert self.oai_ws is not None
         await self.oai_ws.send(json.dumps(payload))
 
@@ -135,6 +137,48 @@ class CallSession:
         await self._oai_send_json({"type": "input_audio_buffer.commit"})
 
     async def _twilio_clear(self):
+
+    async def _azure_tts_synthesize(self, text: str) -> bytes:
+        """Synthesize German TTS via Azure as 8kHz μ-law bytes ready for Twilio."""
+        if not AZURE_TTS_KEY or not AZURE_TTS_REGION:
+            raise RuntimeError("Azure TTS not configured")
+        ssml = f"""
+<speak version='1.0' xml:lang='de-DE'>
+  <voice name='{AZURE_TTS_VOICE}'>
+    <prosody rate='0%'>{text}</prosody>
+  </voice>
+</speak>
+"""
+        url = f"https://{AZURE_TTS_REGION}.tts.speech.microsoft.com/cognitiveservices/v1"
+        headers = {
+            "Ocp-Apim-Subscription-Key": AZURE_TTS_KEY,
+            "Content-Type": "application/ssml+xml",
+            "X-Microsoft-OutputFormat": "mulaw-8khz-8bit",
+            "User-Agent": "wowona-rt-bridge/1.0"
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, data=ssml.encode("utf-8"), headers=headers) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    raise RuntimeError(f"Azure TTS failed {resp.status}: {body[:200]}")
+                data = await resp.read()
+                return data
+
+    async def _send_mulaw_to_twilio(self, mulaw_bytes: bytes):
+        """Chunk μ-law bytes into ~20ms frames (160 bytes) and send to Twilio as base64 payloads."""
+        if not mulaw_bytes:
+            return
+        frame = 160  # 20ms @ 8kHz μ-law, 8-bit
+        for i in range(0, len(mulaw_bytes), frame):
+            if self._barge_in_triggered:
+                break
+            chunk = mulaw_bytes[i:i+frame]
+            b64 = base64.b64encode(chunk).decode("ascii")
+            await self.twilio_ws.send_text(json.dumps({
+                "event": "media",
+                "media": {"payload": b64}
+            }))
+            await asyncio.sleep(0.02)
         """Tell Twilio to clear any buffered outbound audio (barge-in)."""
         try:
             if self.twilio_stream_sid:
@@ -184,6 +228,8 @@ class CallSession:
                         self._barge_in_triggered = True
                     media = data.get("media", {})
                     payload = media.get("payload")
+                    self.user_speaking = True
+                    self._last_media_ts = time.time()
                     if payload:
                         try:
                             await self._oai_send_audio_chunk(payload)
@@ -221,8 +267,13 @@ class CallSession:
                     role = item.get("role") or item.get("type")
                     if role == "assistant":
                         self.last_assistant_item_id = item.get("id")
-                elif mtype == "response.output_audio.delta":
+                elif mtype == "response.output_audio.delta" and not USE_AZURE_TTS:
                     self.assistant_speaking = True
+                elif mtype == "response.output_text.delta" and USE_AZURE_TTS:
+                    delta_text = evt.get("delta", "")
+                    if delta_text:
+                        self._text_buf.append(delta_text)
+                        self.assistant_speaking = True
                     # New GA event field name: 'delta' (base64 μ-law chunk)
                     delta = evt.get("delta")
                     if delta:
@@ -231,8 +282,19 @@ class CallSession:
                             "media": {"payload": delta}
                         }))
                 elif mtype == "response.completed":
+                    # Send buffered text via Azure TTS if enabled
+                    if USE_AZURE_TTS and self._text_buf:
+                        try:
+                            text = "".join(self._text_buf).strip()
+                            self._text_buf.clear()
+                            if text:
+                                audio = await self._azure_tts_synthesize(text)
+                                # Reset barge-in flag for fresh playback window
+                                self._barge_in_triggered = False
+                                await self._send_mulaw_to_twilio(audio)
+                        except Exception as e:
+                            print("Azure TTS error:", e)
                     self.assistant_speaking = False
-                    # Optionally tell Twilio about a mark to help with duplex-barge-in
                     await self.twilio_ws.send_text(json.dumps({
                         "event": "mark", "mark": {"name": "oai_response_end"}
                     }))
@@ -246,12 +308,31 @@ class CallSession:
         finally:
             self.closed = True
 
-    async def run(self):
+    
+    async def _silence_watcher(self, quiet_ms: int = 800):
+        """Commit & create response after short silence since last media."""
+        try:
+            while not self.closed:
+                await asyncio.sleep(0.1)
+                if not self.user_speaking:
+                    continue
+                if (time.time() - self._last_media_ts) * 1000 >= quiet_ms:
+                    self.user_speaking = False
+                    try:
+                        await self._oai_send_json({"type": "input_audio_buffer.commit"})
+                        
+                    except Exception as e:
+                        print("silence_watcher error:", e)
+        except Exception as e:
+            print("silence_watcher crashed:", e)
+async def run(self):
         await self._connect_openai()
         # Run pumps concurrently
+        watcher_task = asyncio.create_task(self._silence_watcher())
         await asyncio.gather(
             self._pipe_twilio_to_openai(),
             self._pipe_openai_to_twilio(),
+            watcher_task,
         )
         # Cleanup
         try:
@@ -276,4 +357,6 @@ async def media_stream(ws: WebSocket):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5050"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
