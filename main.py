@@ -120,7 +120,7 @@ class CallSession:
             }
         }
         await self._oai_send_json(session_update)
-async def _oai_send_json(self, payload: dict):
+    async def _oai_send_json(self, payload: dict):
         assert self.oai_ws is not None
         await self.oai_ws.send(json.dumps(payload))
 
@@ -137,6 +137,15 @@ async def _oai_send_json(self, payload: dict):
         await self._oai_send_json({"type": "input_audio_buffer.commit"})
 
     async def _twilio_clear(self):
+        """Tell Twilio to clear any buffered outbound audio (barge-in)."""
+        try:
+            if self.twilio_stream_sid:
+                await self.twilio_ws.send_text(json.dumps({
+                    "event": "clear",
+                    "streamSid": self.twilio_stream_sid
+                }))
+        except Exception as e:
+            print("Twilio clear error:", e)
 
     async def _azure_tts_synthesize(self, text: str) -> bytes:
         """Synthesize German TTS via Azure as 8kHz μ-law bytes ready for Twilio."""
@@ -357,6 +366,4 @@ async def media_stream(ws: WebSocket):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5050"))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
-
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
