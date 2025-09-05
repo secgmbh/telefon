@@ -31,7 +31,7 @@ TWILIO_SUBPROTOCOL = "audio.stream.twilio.com"  # Twilio erwartet dieses Subprot
 # ===================== APP =====================
 app = FastAPI()
 
-# ===================== Hilfsfunktionen (Key-Diagnose & Preflight) =====================
+# ===================== Key-Logging (ohne Leaks) & Preflight =====================
 def _mask_key(k: str) -> str:
     if not k:
         return "<empty>"
@@ -49,7 +49,7 @@ try:
     env_path = os.path.join(os.getcwd(), ".env")
     if os.path.exists(env_path):
         dv = dotenv_values(env_path)
-        file_key = dv.get("OPENAI_API_KEY", "")
+        file_key = (dv.get("OPENAI_API_KEY", "") or "").strip()
         print(f"[KEY CHECK] .env OPENAI_API_KEY: {_mask_key(file_key)} → {_classify_key(file_key)} (from {env_path})")
     else:
         print("[KEY CHECK] .env not found")
@@ -75,10 +75,7 @@ def _preflight_openai_key(key: str):
 
 _preflight_openai_key(OPENAI_API_KEY)
 
-# ===================== μ-law <-> PCM16 @ 8kHz (nur für optionale VAD) =====================
-_ULAW_BIAS = 0x84  # 132
-_ULAW_CLIP = 32635
-
+# ===================== μ-law <-> PCM16 (nur für VAD-Prüfung) =====================
 def ulaw_decode_bytes(ulaw_bytes: bytes) -> bytes:
     """G.711 μ-law (8-bit) -> PCM16 little-endian (int16)"""
     u = np.frombuffer(ulaw_bytes, dtype=np.uint8)
@@ -87,16 +84,15 @@ def ulaw_decode_bytes(ulaw_bytes: bytes) -> bytes:
     exp = (u >> 4) & 0x07
     mant = u & 0x0F
     magnitude = ((mant.astype(np.int32) << 4) + 0x08) << exp
-    magnitude = magnitude + _ULAW_BIAS
-    magnitude = magnitude - _ULAW_BIAS
+    magnitude = magnitude + 0x84
+    magnitude = magnitude - 0x84
     pcm = magnitude.astype(np.int32)
     pcm[sign] = -pcm[sign]
     pcm = np.clip(pcm, -32768, 32767).astype(np.int16)
     return pcm.tobytes()
 
-# ===================== sehr einfache VAD (optional) =====================
 def is_voice_pcm16(pcm16_le: bytes, threshold: float = 600.0) -> bool:
-    """Simple RMS-Schwelle; erhöhe threshold (z. B. 800–1000) bei lauter Umgebung."""
+    """Sehr einfache RMS-VAD."""
     if not pcm16_le:
         return False
     x = np.frombuffer(pcm16_le, dtype=np.int16).astype(np.float32)
@@ -108,10 +104,8 @@ def is_voice_pcm16(pcm16_le: bytes, threshold: float = 600.0) -> bool:
 # ===================== HTTP: TwiML =====================
 @app.api_route("/telefon_live", methods=["GET", "POST"])
 async def telefon_live():
-    # Empfohlen: TWILIO_STREAM_WSS=wss://<deine-domain>/twilio-stream
     wss_url = os.getenv("TWILIO_STREAM_WSS") or ("wss://YOUR_DOMAIN" + STREAM_WSS_PATH)
     print("TwiML requested. Using stream URL:", wss_url)
-    # KEIN <Say> – Stream sofort starten
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
@@ -134,13 +128,13 @@ class Bridge:
         # Timing/Buffering
         self.last_media_ts: float = 0.0
         self.last_commit_ts: float = 0.0
-        self.last_activity_ts: float = time.time()  # nur Info
+        self.last_activity_ts: float = time.time()
         self.bytes_buffered: int = 0
 
-        # Sprachdauer vor Commit
-        self.MIN_VOICED_MS = 400  # mindestens 0.4 s echte Sprache vor Commit
+        # Sprachdauer vor Commit (μ-law ≈ 1 Byte/Sample @ 8 kHz → 8 Bytes/ms)
+        self.MIN_VOICED_MS = 400
         self.voiced_bytes_since_last_commit = 0
-        self.voiced_threshold_met = False  # wird True, sobald Mindestsprachdauer erreicht
+        self.voiced_threshold_met = False
 
         # Tasks/State
         self.commit_task: Optional[asyncio.Task] = None
@@ -148,27 +142,29 @@ class Bridge:
         self.closed = False
         self.seen_start = False
 
-        # Latenz-Tuning (μ-law ~8 kB/s)
-        self.BUFFER_BYTES_THRESHOLD = 3000   # ~0.375 s Audio bis Commit
-        self.FORCE_COMMIT_INTERVAL = 0.7     # spätestens nach 0.7 s committen
-        self.SILENCE_COMMIT_GAP = 0.18       # ~180 ms Pause = Commit
+        # Latenz-Tuning
+        self.BUFFER_BYTES_THRESHOLD = 3000   # ~0.375 s Audio
+        self.FORCE_COMMIT_INTERVAL = 0.7     # s
+        self.SILENCE_COMMIT_GAP = 0.18       # s
 
-        # Idle-Features bewusst deaktiviert (KI wartet auf echte Sprache)
+        # Idle deaktiviert
         self.IDLE_PROMPT_AFTER = None
         self.HANGUP_AFTER_IDLE = None
         self.idle_prompt_sent = False
 
     async def open_openai(self):
         url = f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}"
-        # Verwende offizielles Subprotocol + Auth-Header
-        headers = [("Authorization", f"Bearer {OPENAI_API_KEY}")]
-        subprotocols = ["openai-beta.realtime.v1"]
+        headers = [
+            ("Authorization", f"Bearer {OPENAI_API_KEY}"),
+            ("OpenAI-Beta", "realtime=v1"),  # Fallback
+        ]
+        subprotocols = ["realtime", "openai-beta.realtime.v1"]
 
         if not OPENAI_API_KEY or not OPENAI_API_KEY.startswith("sk-"):
             print("⚠️  OPENAI_API_KEY fehlt/ungültig. Bitte Environment prüfen.")
         try:
             print("OAI: connecting →", url)
-            print("OAI: using subprotocols:", subprotocols, " | auth header present:", bool(OPENAI_API_KEY))
+            print("OAI: offering subprotocols:", subprotocols, "| auth header present:", bool(OPENAI_API_KEY))
             self.oai_ws = await asyncio.wait_for(
                 websockets.connect(
                     url,
@@ -178,14 +174,13 @@ class Bridge:
                 ),
                 timeout=5.0
             )
-            print("OAI: connected")
+            print("OAI: connected (negotiated subprotocol:", getattr(self.oai_ws, "subprotocol", None), ")")
             await self.oai_ws.send(json.dumps({
                 "type": "session.update",
                 "session": {
                     "instructions": SYSTEM_PROMPT,
                     "modalities": ["audio", "text"],
                     "voice": VOICE,
-                    # μ-law passthrough (8 kHz)
                     "input_audio_format": "g711_ulaw",
                     "output_audio_format": "g711_ulaw",
                 },
@@ -214,16 +209,15 @@ class Bridge:
             await asyncio.sleep(0.05)
             now = time.time()
 
-            # Während KI spricht: niemals committen
             if self.playing_audio:
                 continue
 
-            # Nur committen, wenn Mindestsprachdauer erreicht wurde
-            min_voiced_bytes = int(self.MIN_VOICED_MS * 8)  # μ-law ≈ 1 byte pro Sample @8kHz → ~8 Bytes/ms
+            # Mindestsprachdauer prüfen
+            min_voiced_bytes = int(self.MIN_VOICED_MS * 8)  # ≈ 8 Bytes/ms
             if self.voiced_bytes_since_last_commit >= min_voiced_bytes:
                 self.voiced_threshold_met = True
 
-            # (1) Commit bei ~180 ms Stille, NUR wenn Sprachschwelle erreicht
+            # (1) Commit nach ~180 ms Stille (nur wenn Sprachschwelle erreicht)
             if (
                 self.voiced_threshold_met
                 and self.last_media_ts
@@ -235,7 +229,7 @@ class Bridge:
                 self._reset_after_commit(now)
                 continue
 
-            # (2) Spätestens nach 0.7 s committen, falls genug gepuffert UND Sprachschwelle erreicht
+            # (2) Spätestens nach 0.7 s committen (nur wenn Sprachschwelle erreicht)
             if (
                 self.voiced_threshold_met
                 and self.bytes_buffered >= self.BUFFER_BYTES_THRESHOLD
@@ -245,7 +239,7 @@ class Bridge:
                 await self._commit_and_request_response()
                 self._reset_after_commit(now)
 
-            # Keine Idle-Automatik: KI bleibt still und wartet auf Sprache
+            # keine Idle-Automatik
 
     def _reset_after_commit(self, now: float):
         self.bytes_buffered = 0
@@ -270,7 +264,6 @@ class Bridge:
     async def receive_from_twilio(self):
         try:
             while True:
-                # Twilio sendet Text- oder Binary-Frames
                 try:
                     raw = await self.twilio_ws.receive_text()
                 except Exception:
@@ -284,6 +277,7 @@ class Bridge:
 
                 data = json.loads(raw)
                 event = data.get("event")
+
                 if event == "connected":
                     pass
 
@@ -295,7 +289,7 @@ class Bridge:
                     self.last_activity_ts = time.time()
                     self.idle_prompt_sent = False
 
-                    # Proaktive Begrüßung → sofort Audio zurückschicken
+                    # Proaktive Begrüßung
                     try:
                         await self.oai_ws.send(json.dumps({
                             "type": "response.create",
@@ -309,7 +303,6 @@ class Bridge:
                         print("OAI proactive greeting error:", repr(e))
 
                 elif event == "media":
-                    # Während die KI spricht → eingehendes Audio ignorieren (verhindert Echo/Übersprechen)
                     if self.playing_audio:
                         self.last_media_ts = time.time()
                         continue
@@ -317,28 +310,26 @@ class Bridge:
                     ulaw_b64 = data["media"]["payload"]
                     ulaw = base64.b64decode(ulaw_b64)
 
-                    # OPTIONAL: VAD (prüfe kurz in PCM16, Audiofluss bleibt μ-law)
+                    # VAD-Prüfung (Audiofluss bleibt μ-law)
                     if not is_voice_pcm16(ulaw_decode_bytes(ulaw), threshold=600.0):
                         self.last_media_ts = time.time()
                         continue
 
-                    # μ-law direkt an OpenAI anhängen (keine Umkodierung!)
+                    # μ-law direkt an OpenAI anhängen
                     b = base64.b64encode(ulaw).decode()
                     await self.oai_ws.send(json.dumps({
                         "type": "input_audio_buffer.append",
                         "audio": b,
                     }))
 
-                    # Buffer-Tracking
                     self.bytes_buffered += len(ulaw)
-                    self.voiced_bytes_since_last_commit += len(ulaw)  # gezählt nur bei Stimme
+                    self.voiced_bytes_since_last_commit += len(ulaw)
                     self.last_media_ts = time.time()
                     self.last_activity_ts = time.time()
                     self.idle_prompt_sent = False
 
                 elif event == "stop":
                     print("Twilio stop")
-                    # Kein erzwungener Commit am Ende, wenn Sprachschwelle nicht erreicht wurde
                     if self.bytes_buffered > 0 and self.voiced_threshold_met and not self.playing_audio:
                         await self._commit_and_request_response()
                         self._reset_after_commit(time.time())
@@ -367,7 +358,7 @@ class Bridge:
                     b64 = data.get("delta") or data.get("audio")
                     if not b64:
                         continue
-                    # OpenAI liefert bereits μ-law – direkt durchreichen
+                    # μ-law direkt durchreichen
                     print("OAI → delta audio (bytes):", len(b64))
                     if self.stream_sid:
                         await self._twilio_send({
@@ -386,8 +377,7 @@ class Bridge:
                             "mark": {"name": "assistant_turn_done"},
                         })
                         self.playing_audio = False
-                        # Nach Ende der KI-Antwort: Reset der Voice-Schwelle,
-                        # damit deine nächste Antwort wieder 0.4s sammeln muss
+                        # Nächste Nutzerantwort wieder mit 0.4s Mindestsprachdauer
                         self.voiced_bytes_since_last_commit = 0
                         self.voiced_threshold_met = False
                         self.last_activity_ts = time.time()
@@ -435,7 +425,6 @@ class Bridge:
 # ===================== WS Route =====================
 @app.websocket("/twilio-stream")
 async def twilio_stream(ws: WebSocket):
-    # Header-Log & Subprotocol-Handshake
     headers_dict = dict(ws.headers)
     print("WS headers:", headers_dict)
     try:
