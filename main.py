@@ -13,7 +13,11 @@ import websockets
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 OPENAI_REALTIME_MODEL = os.environ.get("OPENAI_REALTIME_MODEL", "gpt-realtime")
 TWILIO_VOICE = os.environ.get("TWILIO_VOICE", "verse")
-REALTIME_SYSTEM_PROMPT = os.environ.get("REALTIME_SYSTEM_PROMPT", "Du bist ein freundlicher deutschsprachiger Telefonassistent.")
+REALTIME_SYSTEM_PROMPT = os.environ.get("REALTIME_SYSTEM_PROMPT", (
+    "Du bist eine deutschsprachige Telefonassistenz. "
+    "Sprich akzentfrei auf Hochdeutsch (de-DE), klare Artikulation, kurze Sätze, natürliches Tempo. "
+    "Benutze deutsche Zahlen- und Datumsformate. Bei Unsicherheit: kurz nachfragen."
+))
 if not OPENAI_API_KEY:
     raise RuntimeError("Please set OPENAI_API_KEY in your environment.")
 
@@ -71,6 +75,9 @@ class CallSession:
         self.closed = False
         self.oai_ready = False
         self.twilio_stream_sid = None
+        self.assistant_speaking = False
+        self.last_assistant_item_id = None
+        self._barge_in_triggered = False
 
     async def _connect_openai(self):
         url = "wss://api.openai.com/v1/realtime?model=gpt-realtime"
@@ -93,6 +100,7 @@ class CallSession:
                 "instructions": (
                     REALTIME_SYSTEM_PROMPT
                 ),
+                "input_audio_transcription": {"enabled": True, "language": "de"},
                 "audio": {
                     "input": {
                         "format": {"type": "audio/pcmu"},
@@ -123,6 +131,17 @@ class CallSession:
         })
 
     async def _oai_finish_input(self):
+
+    async def _twilio_clear(self):
+        """Tell Twilio to clear any buffered outbound audio (barge-in)."""
+        try:
+            if self.twilio_stream_sid:
+                await self.twilio_ws.send_text(json.dumps({
+                    "event": "clear",
+                    "streamSid": self.twilio_stream_sid
+                }))
+        except Exception as e:
+            print("Twilio clear error:", e)
         # With server VAD this is optional, but safe to call on Twilio "mark" or pauses
         await self._oai_send_json({"type": "input_audio_buffer.commit"})
 
@@ -141,6 +160,26 @@ class CallSession:
                     if not self.oai_ready:
                         # Drop audio until OpenAI session is updated
                         continue
+                    # Barge-in: if assistant is speaking and caller speaks, clear buffered audio & cancel current response
+                    if self.assistant_speaking and not self._barge_in_triggered:
+                        await self._twilio_clear()
+                        try:
+                            await self._oai_send_json({"type": "response.cancel"})
+                        except Exception as e:
+                            print("response.cancel failed:", e)
+                        # Optional: truncate last assistant item to keep transcript clean
+                        if self.last_assistant_item_id:
+                            try:
+                                await self._oai_send_json({
+                                    "type": "conversation.item.truncate",
+                                    "item_id": self.last_assistant_item_id,
+                                    "content_index": 0,
+                                    "audio_end_ms": 0
+                                })
+                            except Exception as e:
+                                print("truncate failed:", e)
+                        self.assistant_speaking = False
+                        self._barge_in_triggered = True
                     media = data.get("media", {})
                     payload = media.get("payload")
                     if payload:
@@ -172,7 +211,16 @@ class CallSession:
 
                 if mtype == "session.updated":
                     self.oai_ready = True
+                elif mtype == "response.created":
+                    # New response starting; allow future barge-in
+                    self._barge_in_triggered = False
+                elif mtype == "conversation.item.created":
+                    item = evt.get("item", {})
+                    role = item.get("role") or item.get("type")
+                    if role == "assistant":
+                        self.last_assistant_item_id = item.get("id")
                 elif mtype == "response.output_audio.delta":
+                    self.assistant_speaking = True
                     # New GA event field name: 'delta' (base64 μ-law chunk)
                     delta = evt.get("delta")
                     if delta:
@@ -181,10 +229,13 @@ class CallSession:
                             "media": {"payload": delta}
                         }))
                 elif mtype == "response.completed":
+                    self.assistant_speaking = False
                     # Optionally tell Twilio about a mark to help with duplex-barge-in
                     await self.twilio_ws.send_text(json.dumps({
                         "event": "mark", "mark": {"name": "oai_response_end"}
                     }))
+                elif mtype == "response.cancelled":
+                    self.assistant_speaking = False
                 elif mtype == "error":
                     err = evt.get("error", {})
                     print("OpenAI error:", err)
