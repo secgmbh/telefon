@@ -26,6 +26,10 @@ async def root():
     # Render hits '/' for health checks by default; return 200.
     return PlainTextResponse("service: ok\nendpoints: /healthz, /incoming-call, /telefon_live, /media-stream")
 
+@app.head("/")
+async def root_head():
+    return PlainTextResponse("ok")
+
 @app.post("/incoming-call")
 async def incoming_call():
     """Twilio will hit this endpoint first. We respond with TwiML that
