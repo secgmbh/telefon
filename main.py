@@ -23,16 +23,19 @@ SYSTEM_PROMPT = os.getenv(
     "Du bist Maria, eine freundliche, präzise deutschsprachige Assistentin. "
     "Sprich ausschließlich Deutsch. Antworte kurz und direkt.",
 )
+# Proaktive Begrüßung konfigurierbar
+GREETING = os.getenv("FIRST_GREETING", "Hallo, ich bin Maria von wowona. Womit kann ich helfen?")
 
-TWILIO_SUBPROTOCOL = "audio.stream.twilio.com"
+TWILIO_SUBPROTOCOL = "audio.stream.twilio.com"  # Twilio erwartet dieses Subprotocol
 
 app = FastAPI()
 
 # ---------- μ-law <-> PCM16 @ 8kHz (ohne audioop) ----------
-_ULAW_BIAS = 0x84
+_ULAW_BIAS = 0x84  # 132
 _ULAW_CLIP = 32635
 
 def ulaw_decode_bytes(ulaw_bytes: bytes) -> bytes:
+    """Decode G.711 μ-law (8-bit) -> PCM16 little-endian (int16)"""
     u = np.frombuffer(ulaw_bytes, dtype=np.uint8)
     u = np.bitwise_xor(u, 0xFF)
     sign = (u & 0x80) != 0
@@ -47,6 +50,7 @@ def ulaw_decode_bytes(ulaw_bytes: bytes) -> bytes:
     return pcm.tobytes()
 
 def _ulaw_segment_scalar(x: int) -> int:
+    """Bestimme Segment (0..7) für μ-law, scalar."""
     if x >= 0x4000: return 7
     if x >= 0x2000: return 6
     if x >= 0x1000: return 5
@@ -57,6 +61,7 @@ def _ulaw_segment_scalar(x: int) -> int:
     return 0
 
 def ulaw_encode_bytes(pcm_bytes: bytes) -> bytes:
+    """Encode PCM16 little-endian (int16) -> G.711 μ-law (8-bit)"""
     x = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.int32)
     x = np.clip(x, -_ULAW_CLIP, _ULAW_CLIP)
     sign = x < 0
@@ -96,20 +101,20 @@ class Bridge:
         self.twilio_ws = twilio_ws
         self.oai_ws: Optional[websockets.WebSocketClientProtocol] = None
         self.stream_sid: Optional[str] = None
+
         self.last_media_ts: float = 0.0
+        self.last_commit_ts: float = 0.0
+        self.bytes_buffered: int = 0
+
         self.commit_task: Optional[asyncio.Task] = None
         self.playing_audio: bool = False
         self.closed = False
         self.seen_start = False
 
-        # Neu: zeit-/mengenbasierter Commit
-        self.bytes_buffered: int = 0
-        self.last_commit_ts: float = 0.0
-
-        # Schwellen (8 kHz, 16 bit => ~16kB/s). 8kB ~ 0,5 s Audio.
-        self.BUFFER_BYTES_THRESHOLD = 8000     # commit wenn >= 0.5 s Audio gesammelt
-        self.FORCE_COMMIT_INTERVAL = 1.0       # spätestens nach 1.0 s committen
-        self.SILENCE_COMMIT_GAP = 0.20         # bei ~200 ms Pause committen
+        # Latenz-Tuning (8 kHz, 16 bit ≈ 16 kB/s)
+        self.BUFFER_BYTES_THRESHOLD = 6000   # ~0.375 s Audio bis Commit
+        self.FORCE_COMMIT_INTERVAL = 0.7     # spätestens nach 0.7 s committen
+        self.SILENCE_COMMIT_GAP = 0.18       # ~180 ms Pause = Commit
 
     async def open_openai(self):
         url = f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}"
@@ -156,16 +161,16 @@ class Bridge:
             await asyncio.sleep(0.05)
             now = time.time()
 
-            # 1) Commit bei Stille (~200 ms ohne neue Frames)
+            # 1) Commit bei Stille (~180 ms ohne neue Frames)
             if self.last_media_ts and (now - self.last_media_ts > self.SILENCE_COMMIT_GAP) and self.bytes_buffered > 0:
-                print("Auto-commit (silence): committing after ~200ms pause")
+                print("Auto-commit (silence): committing after ~180ms pause")
                 await self._commit_and_request_response()
                 self.bytes_buffered = 0
                 self.last_commit_ts = now
                 self.last_media_ts = 0.0
                 continue
 
-            # 2) Spätestens nach 1.0 s committen, wenn genügend Audio gesammelt
+            # 2) Spätestens nach 0.7 s committen, wenn genug Audio gesammelt ist
             if self.bytes_buffered >= self.BUFFER_BYTES_THRESHOLD and (now - self.last_commit_ts) >= self.FORCE_COMMIT_INTERVAL:
                 print(f"Auto-commit (force): bytes_buffered={self.bytes_buffered}, dt={now - self.last_commit_ts:.2f}s")
                 await self._commit_and_request_response()
@@ -188,6 +193,7 @@ class Bridge:
     async def receive_from_twilio(self):
         try:
             while True:
+                # Twilio kann Text- oder Binary-Frames schicken
                 try:
                     raw = await self.twilio_ws.receive_text()
                 except Exception:
@@ -208,6 +214,20 @@ class Bridge:
                     self.stream_sid = data.get("start", {}).get("streamSid")
                     print("Twilio start, streamSid:", self.stream_sid)
                     self.last_commit_ts = time.time()
+
+                    # >>> Proaktive kurze Begrüßung, damit SOFORT Audio zurückfließt
+                    try:
+                        await self.oai_ws.send(json.dumps({
+                            "type": "response.create",
+                            "response": {
+                                "modalities": ["audio", "text"],
+                                "instructions": GREETING
+                            }
+                        }))
+                        print("OAI: proactive greeting response.create sent")
+                    except Exception as e:
+                        print("OAI proactive greeting error:", repr(e))
+
                 elif event == "media":
                     ulaw_b64 = data["media"]["payload"]
                     ulaw = base64.b64decode(ulaw_b64)
@@ -229,6 +249,7 @@ class Bridge:
                     # Buffer-Tracking
                     self.bytes_buffered += len(pcm16_8k)
                     self.last_media_ts = time.time()
+
                 elif event == "stop":
                     print("Twilio stop")
                     if self.bytes_buffered > 0:
@@ -314,6 +335,7 @@ class Bridge:
 
 @app.websocket("/twilio-stream")
 async def twilio_stream(ws: WebSocket):
+    # Header-Check & Subprotocol-Handshake
     headers_dict = dict(ws.headers)
     print("WS headers:", headers_dict)
     try:
