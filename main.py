@@ -34,7 +34,7 @@ async def healthz():
 
 @app.get("/")
 async def root():
-    return PlainTextResponse("service: ok\nendpoints: /healthz, /diag, /incoming-call, /telefon_live, /media-stream")
+    return PlainTextResponse("service: ok\nendpoints: /healthz, /diag, /incoming-call, /telefon_live, /media-stream, /stream-status")
 
 @app.head("/")
 async def root_head():
@@ -71,33 +71,59 @@ async def diag():
         return PlainTextResponse("diag: failed - " + repr(e), status_code=500)
 
 # ===== TwiML helpers =====
-def _twiml(ws_url: str, greeting: Optional[str]) -> str:
-    if greeting:
-        return f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say language="de-DE">{greeting}</Say>
-  <Connect><Stream url="{ws_url}" track="both"/></Connect>
-</Response>"""
+def _twiml(ws_url: str, greeting: Optional[str], status_cb: str) -> str:
+    say = f'<Say language="de-DE">{greeting}</Say>\n  ' if greeting else ""
+    # statusCallback hilft zu erkennen, warum Twilio evtl. nicht verbindet
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Connect><Stream url="{ws_url}" track="both"/></Connect>
+  {say}<Connect>
+    <Stream url="{ws_url}" track="both" statusCallback="{status_cb}" statusCallbackMethod="POST"/>
+  </Connect>
 </Response>"""
+
+def _infer_host(request: Request) -> str:
+    return request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
 
 def _infer_ws_url(request: Request) -> str:
     if STREAM_WS_URL:
         return STREAM_WS_URL
-    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or ""
+    host = _infer_host(request)
     return f"wss://{host}/media-stream"
+
+def _infer_status_cb(request: Request) -> str:
+    host = _infer_host(request)
+    return f"https://{host}/stream-status"
 
 @app.post("/incoming-call")
 async def incoming_call(request: Request):
     ws_url = _infer_ws_url(request)
-    return HTMLResponse(_twiml(ws_url, TWIML_GREETING or None), media_type="application/xml")
+    status_cb = _infer_status_cb(request)
+    return HTMLResponse(_twiml(ws_url, TWIML_GREETING or None, status_cb), media_type="application/xml")
 
-@app.post("/telefon_live")
+@app.api_route("/telefon_live", methods=["GET", "POST"])
 async def telefon_live(request: Request):
     ws_url = _infer_ws_url(request)
-    return HTMLResponse(_twiml(ws_url, TWIML_GREETING or None), media_type="application/xml")
+    status_cb = _infer_status_cb(request)
+    # Logge die eingehenden Twilio-Parameter (hilfreich zum Trace)
+    try:
+        form = await request.form()
+        print("Twilio /telefon_live form:", dict(form))
+    except Exception:
+        pass
+    return HTMLResponse(_twiml(ws_url, TWIML_GREETING or None, status_cb), media_type="application/xml")
+
+@app.api_route("/stream-status", methods=["POST", "GET"])
+async def stream_status(request: Request):
+    # Twilio schickt x-www-form-urlencoded
+    try:
+        form = await request.form()
+        payload = dict(form)
+        print("Twilio StreamStatus:", payload)
+        return PlainTextResponse("ok")
+    except Exception:
+        body = (await request.body()).decode("utf-8", "ignore")
+        print("Twilio StreamStatus (raw):", body)
+        return PlainTextResponse("ok")
 
 # ========= Bridge =========
 class CallSession:
@@ -185,6 +211,7 @@ class CallSession:
 
                 if event == "start":
                     self.twilio_stream_sid = data.get("start", {}).get("streamSid")
+                    print("Twilio WS start:", self.twilio_stream_sid)
                 elif event == "media":
                     if not self.oai_ready:
                         continue
@@ -206,7 +233,10 @@ class CallSession:
                             print("append failed:", e)
                             self.closed = True
                             break
+                elif event == "mark":
+                    pass
                 elif event == "stop":
+                    print("Twilio WS stop")
                     break
         except WebSocketDisconnect:
             pass
