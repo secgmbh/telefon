@@ -18,7 +18,7 @@ load_dotenv()
 # ===================== ENV =====================
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
-STREAM_WSS_PATH = os.getenv("TWILIO_STREAM_PATH", "/twilio-stream")  # Fallback, falls TWILIO_STREAM_WSS fehlt
+STREAM_WSS_PATH = os.getenv("TWILIO_STREAM_PATH", "/twilio-stream")  # Fallback
 VOICE = os.getenv("TWILIO_VOICE", "alloy")
 SYSTEM_PROMPT = os.getenv(
     "REALTIME_SYSTEM_PROMPT",
@@ -76,7 +76,7 @@ def _preflight_openai_key(key: str):
 
 _preflight_openai_key(OPENAI_API_KEY)
 
-# ===================== μ-law <-> PCM16 @ 8kHz =====================
+# ===================== μ-law <-> PCM16 @ 8kHz (nur für optionale VAD) =====================
 _ULAW_BIAS = 0x84  # 132
 _ULAW_CLIP = 32635
 
@@ -95,35 +95,8 @@ def ulaw_decode_bytes(ulaw_bytes: bytes) -> bytes:
     pcm = np.clip(pcm, -32768, 32767).astype(np.int16)
     return pcm.tobytes()
 
-def _ulaw_segment_scalar(x: int) -> int:
-    if x >= 0x4000: return 7
-    if x >= 0x2000: return 6
-    if x >= 0x1000: return 5
-    if x >= 0x0800: return 4
-    if x >= 0x0400: return 3
-    if x >= 0x0200: return 2
-    if x >= 0x0100: return 1
-    return 0
-
-def ulaw_encode_bytes(pcm_bytes: bytes) -> bytes:
-    """PCM16 little-endian (int16) -> G.711 μ-law (8-bit)"""
-    x = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.int32)
-    x = np.clip(x, -_ULAW_CLIP, _ULAW_CLIP)
-    sign = x < 0
-    x = np.abs(x).astype(np.int32) + _ULAW_BIAS
-    ulaw = np.empty(x.shape[0], dtype=np.uint8)
-    for i in range(x.shape[0]):
-        xi = x[i]
-        seg = _ulaw_segment_scalar(xi)
-        mant = (xi >> (seg + 3)) & 0x0F
-        u = ((seg << 4) | mant) ^ 0xFF
-        if sign[i]:
-            u |= 0x80
-        ulaw[i] = u
-    return ulaw.tobytes()
-
-# ===================== sehr einfache VAD (Rauschfilter) =====================
-def is_voice(pcm16_le: bytes, threshold: float = 600.0) -> bool:
+# ===================== sehr einfache VAD (optional) =====================
+def is_voice_pcm16(pcm16_le: bytes, threshold: float = 600.0) -> bool:
     """Simple RMS-Schwelle; erhöhe threshold (z. B. 800–1000) bei lauter Umgebung."""
     if not pcm16_le:
         return False
@@ -136,10 +109,10 @@ def is_voice(pcm16_le: bytes, threshold: float = 600.0) -> bool:
 # ===================== HTTP: TwiML =====================
 @app.api_route("/telefon_live", methods=["GET", "POST"])
 async def telefon_live():
-    # Entweder fix in ENV (empfohlen): TWILIO_STREAM_WSS=wss://<deine-domain>/twilio-stream
+    # Empfohlen: TWILIO_STREAM_WSS=wss://<deine-domain>/twilio-stream
     wss_url = os.getenv("TWILIO_STREAM_WSS") or ("wss://YOUR_DOMAIN" + STREAM_WSS_PATH)
     print("TwiML requested. Using stream URL:", wss_url)
-    # Wichtig: KEIN <Say> – Stream sofort starten
+    # KEIN <Say> – Stream sofort starten
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
@@ -176,8 +149,8 @@ class Bridge:
         self.HANGUP_AFTER_IDLE = 10.0    # weitere s → Verabschieden + close
         self.idle_prompt_sent = False
 
-        # Latenz-Tuning (8 kHz, 16 bit ≈ 16 kB/s)
-        self.BUFFER_BYTES_THRESHOLD = 6000   # ~0.375 s Audio bis Commit
+        # Latenz-Tuning (8 kHz, μ-law ~8 kB/s)
+        self.BUFFER_BYTES_THRESHOLD = 3000   # ~0.375 s Audio bis Commit (bei μ-law ~8kB/s = 3000~0.37s)
         self.FORCE_COMMIT_INTERVAL = 0.7     # spätestens nach 0.7 s committen
         self.SILENCE_COMMIT_GAP = 0.18       # ~180 ms Pause = Commit
 
@@ -202,11 +175,12 @@ class Bridge:
                     "instructions": SYSTEM_PROMPT,
                     "modalities": ["audio", "text"],
                     "voice": VOICE,
-                    "input_audio_format": "pcm16",
-                    "output_audio_format": "pcm16"
+                    # *** μ-law Passthrough (8 kHz) ***
+                    "input_audio_format": "g711_ulaw",
+                    "output_audio_format": "g711_ulaw",
                 },
             }))
-            print("OAI: session.update sent")
+            print("OAI: session.update sent (μ-law)")
         except Exception as e:
             print("OAI: failed to connect or configure →", repr(e))
             traceback.print_exc()
@@ -232,7 +206,6 @@ class Bridge:
 
             # Während KI spricht: niemals committen
             if self.playing_audio:
-                # Optional: Timeout-Schutz, falls playing stuck (sehr selten)
                 continue
 
             # (1) Commit bei ~180 ms Stille (nur wenn wir zuvor Audio gesammelt haben)
@@ -346,29 +319,22 @@ class Bridge:
 
                     ulaw_b64 = data["media"]["payload"]
                     ulaw = base64.b64decode(ulaw_b64)
-                    pcm16_8k = ulaw_decode_bytes(ulaw)
 
-                    # Rauschen ignorieren (VAD)
-                    if not is_voice(pcm16_8k):
+                    # OPTIONAL: VAD – nur zur Prüfung kurz nach PCM16 decodieren
+                    # (Audiofluss bleibt μ-law Passthrough)
+                    if not is_voice_pcm16(ulaw_decode_bytes(ulaw), threshold=600.0):
                         self.last_media_ts = time.time()
-                        # Keine Bytes anhängen, kein Commit
                         continue
 
-                    # Barge-in: Falls trotzdem noch Audio gespielt wird, stoppen
-                    if self.playing_audio and self.stream_sid:
-                        print("Barge-in: clearing playback")
-                        await self._twilio_send({"event": "clear", "streamSid": self.stream_sid})
-                        self.playing_audio = False
-
-                    # Nur bei „echter“ Stimme an OpenAI anhängen
-                    b = base64.b64encode(pcm16_8k).decode()
+                    # μ-law direkt an OpenAI anhängen (keine Umkodierung!)
+                    b = base64.b64encode(ulaw).decode()
                     await self.oai_ws.send(json.dumps({
                         "type": "input_audio_buffer.append",
                         "audio": b,
                     }))
 
                     # Buffer-Tracking
-                    self.bytes_buffered += len(pcm16_8k)
+                    self.bytes_buffered += len(ulaw)
                     self.last_media_ts = time.time()
                     self.last_activity_ts = time.time()
                     self.idle_prompt_sent = False
@@ -404,14 +370,13 @@ class Bridge:
                     b64 = data.get("delta") or data.get("audio")
                     if not b64:
                         continue
+                    # OpenAI liefert bereits μ-law – direkt durchreichen
                     print("OAI → delta audio (bytes):", len(b64))
-                    pcm16_8k = base64.b64decode(b64)
-                    ulaw = ulaw_encode_bytes(pcm16_8k)
                     if self.stream_sid:
                         await self._twilio_send({
                             "event": "media",
                             "streamSid": self.stream_sid,
-                            "media": {"payload": base64.b64encode(ulaw).decode()},
+                            "media": {"payload": b64},
                         })
                         self.playing_audio = True
 
