@@ -10,32 +10,52 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 from dotenv import load_dotenv
 import websockets
+import urllib.request, urllib.error
 
 load_dotenv()
 
-# --- ENV ---
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# ===================== ENV =====================
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview")
-STREAM_WSS_PATH = os.getenv("TWILIO_STREAM_PATH", "/twilio-stream")
+STREAM_WSS_PATH = os.getenv("TWILIO_STREAM_PATH", "/twilio-stream")  # Fallback, falls TWILIO_STREAM_WSS fehlt
 VOICE = os.getenv("TWILIO_VOICE", "alloy")
 SYSTEM_PROMPT = os.getenv(
     "REALTIME_SYSTEM_PROMPT",
     "Du bist Maria, eine freundliche, präzise deutschsprachige Assistentin. "
-    "Sprich ausschließlich Deutsch. Antworte kurz und direkt.",
+    "Sprich ausschließlich Deutsch. Antworte kurz und direkt."
 )
-# Proaktive Begrüßung konfigurierbar
 GREETING = os.getenv("FIRST_GREETING", "Hallo, ich bin Maria von wowona. Womit kann ich helfen?")
-
 TWILIO_SUBPROTOCOL = "audio.stream.twilio.com"  # Twilio erwartet dieses Subprotocol
 
+# ===================== APP =====================
 app = FastAPI()
 
-# ---------- μ-law <-> PCM16 @ 8kHz (ohne audioop) ----------
+# ===================== Preflight: Key prüfen =====================
+def _preflight_openai_key(key: str):
+    if not key or not key.startswith("sk-"):
+        print("Preflight: Kein/ungültiger OPENAI_API_KEY gesetzt (erwartet 'sk-...').")
+        return
+    try:
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/models",
+            headers={"Authorization": f"Bearer {key}"}
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            print(f"Preflight: OpenAI key ok → HTTP {resp.status}")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "ignore")
+        print(f"Preflight: HTTPError {e.code} → {body[:160]} …")
+    except Exception as e:
+        print("Preflight: request error →", repr(e))
+
+_preflight_openai_key(OPENAI_API_KEY)
+
+# ===================== μ-law <-> PCM16 @ 8kHz =====================
 _ULAW_BIAS = 0x84  # 132
 _ULAW_CLIP = 32635
 
 def ulaw_decode_bytes(ulaw_bytes: bytes) -> bytes:
-    """Decode G.711 μ-law (8-bit) -> PCM16 little-endian (int16)"""
+    """G.711 μ-law (8-bit) -> PCM16 little-endian (int16)"""
     u = np.frombuffer(ulaw_bytes, dtype=np.uint8)
     u = np.bitwise_xor(u, 0xFF)
     sign = (u & 0x80) != 0
@@ -50,7 +70,6 @@ def ulaw_decode_bytes(ulaw_bytes: bytes) -> bytes:
     return pcm.tobytes()
 
 def _ulaw_segment_scalar(x: int) -> int:
-    """Bestimme Segment (0..7) für μ-law, scalar."""
     if x >= 0x4000: return 7
     if x >= 0x2000: return 6
     if x >= 0x1000: return 5
@@ -61,7 +80,7 @@ def _ulaw_segment_scalar(x: int) -> int:
     return 0
 
 def ulaw_encode_bytes(pcm_bytes: bytes) -> bytes:
-    """Encode PCM16 little-endian (int16) -> G.711 μ-law (8-bit)"""
+    """PCM16 little-endian (int16) -> G.711 μ-law (8-bit)"""
     x = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.int32)
     x = np.clip(x, -_ULAW_CLIP, _ULAW_CLIP)
     sign = x < 0
@@ -77,9 +96,10 @@ def ulaw_encode_bytes(pcm_bytes: bytes) -> bytes:
         ulaw[i] = u
     return ulaw.tobytes()
 
-# ----------------- TwiML endpoint -----------------
+# ===================== HTTP: TwiML =====================
 @app.api_route("/telefon_live", methods=["GET", "POST"])
 async def telefon_live():
+    # Entweder fix in ENV (empfohlen): TWILIO_STREAM_WSS=wss://<deine-domain>/twilio-stream
     wss_url = os.getenv("TWILIO_STREAM_WSS") or ("wss://YOUR_DOMAIN" + STREAM_WSS_PATH)
     print("TwiML requested. Using stream URL:", wss_url)
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -95,17 +115,19 @@ async def telefon_live():
 async def root():
     return Response(content="OK", media_type="text/plain")
 
-# ----------------- WebSocket Bridge -----------------
+# ===================== Bridge =====================
 class Bridge:
     def __init__(self, twilio_ws: WebSocket):
         self.twilio_ws = twilio_ws
         self.oai_ws: Optional[websockets.WebSocketClientProtocol] = None
         self.stream_sid: Optional[str] = None
 
+        # Timing/Buffering
         self.last_media_ts: float = 0.0
         self.last_commit_ts: float = 0.0
         self.bytes_buffered: int = 0
 
+        # Tasks/State
         self.commit_task: Optional[asyncio.Task] = None
         self.playing_audio: bool = False
         self.closed = False
@@ -161,7 +183,7 @@ class Bridge:
             await asyncio.sleep(0.05)
             now = time.time()
 
-            # 1) Commit bei Stille (~180 ms ohne neue Frames)
+            # (1) Commit bei ~180 ms Stille
             if self.last_media_ts and (now - self.last_media_ts > self.SILENCE_COMMIT_GAP) and self.bytes_buffered > 0:
                 print("Auto-commit (silence): committing after ~180ms pause")
                 await self._commit_and_request_response()
@@ -170,7 +192,7 @@ class Bridge:
                 self.last_media_ts = 0.0
                 continue
 
-            # 2) Spätestens nach 0.7 s committen, wenn genug Audio gesammelt ist
+            # (2) Spätestens nach 0.7 s committen, wenn genug Audio gesammelt
             if self.bytes_buffered >= self.BUFFER_BYTES_THRESHOLD and (now - self.last_commit_ts) >= self.FORCE_COMMIT_INTERVAL:
                 print(f"Auto-commit (force): bytes_buffered={self.bytes_buffered}, dt={now - self.last_commit_ts:.2f}s")
                 await self._commit_and_request_response()
@@ -193,7 +215,7 @@ class Bridge:
     async def receive_from_twilio(self):
         try:
             while True:
-                # Twilio kann Text- oder Binary-Frames schicken
+                # Twilio sendet Text- oder Binary-Frames
                 try:
                     raw = await self.twilio_ws.receive_text()
                 except Exception:
@@ -209,13 +231,14 @@ class Bridge:
                 event = data.get("event")
                 if event == "connected":
                     pass
+
                 elif event == "start":
                     self.seen_start = True
                     self.stream_sid = data.get("start", {}).get("streamSid")
                     print("Twilio start, streamSid:", self.stream_sid)
                     self.last_commit_ts = time.time()
 
-                    # >>> Proaktive kurze Begrüßung, damit SOFORT Audio zurückfließt
+                    # Proaktive Begrüßung → sofort Audio zurückschicken
                     try:
                         await self.oai_ws.send(json.dumps({
                             "type": "response.create",
@@ -233,7 +256,7 @@ class Bridge:
                     ulaw = base64.b64decode(ulaw_b64)
                     pcm16_8k = ulaw_decode_bytes(ulaw)
 
-                    # Barge-in: Falls wir gerade abspielen, Playback abbrechen
+                    # Barge-in: Wenn gerade abgespielt wird → abbrechen
                     if self.playing_audio and self.stream_sid:
                         print("Barge-in: clearing playback")
                         await self._twilio_send({"event": "clear", "streamSid": self.stream_sid})
@@ -257,6 +280,7 @@ class Bridge:
                         self.bytes_buffered = 0
                         self.last_commit_ts = time.time()
                     break
+
         except WebSocketDisconnect:
             print("Twilio WS disconnect")
         except Exception as e:
@@ -274,6 +298,7 @@ class Bridge:
                 except Exception:
                     continue
                 t = data.get("type")
+
                 if t in ("response.audio.delta", "response.output_audio.delta"):
                     b64 = data.get("delta") or data.get("audio")
                     if not b64:
@@ -288,6 +313,7 @@ class Bridge:
                             "media": {"payload": base64.b64encode(ulaw).decode()},
                         })
                         self.playing_audio = True
+
                 elif t in ("response.audio.done", "response.output_audio.done"):
                     print("OAI → audio done")
                     if self.stream_sid:
@@ -297,8 +323,10 @@ class Bridge:
                             "mark": {"name": "assistant_turn_done"},
                         })
                         self.playing_audio = False
+
                 elif t and t.startswith("error"):
                     print("OAI error event:", data)
+
         except Exception as e:
             print("OAI pipe error:", repr(e))
 
@@ -333,9 +361,10 @@ class Bridge:
         except Exception as e:
             print("Twilio WS close error:", repr(e))
 
+# ===================== WS Route =====================
 @app.websocket("/twilio-stream")
 async def twilio_stream(ws: WebSocket):
-    # Header-Check & Subprotocol-Handshake
+    # Header-Log & Subprotocol-Handshake
     headers_dict = dict(ws.headers)
     print("WS headers:", headers_dict)
     try:
@@ -353,7 +382,7 @@ async def twilio_stream(ws: WebSocket):
         print("Bridge error:", repr(e))
         await bridge.close()
 
-# Für lokalen Start:
+# ===================== Local dev =====================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
