@@ -1,4 +1,3 @@
-
 import os
 import json
 import asyncio
@@ -18,9 +17,8 @@ OPENAI_REALTIME_MODEL = os.environ.get("OPENAI_REALTIME_MODEL", "gpt-realtime")
 TWILIO_VOICE = os.environ.get("TWILIO_VOICE", "verse")
 REALTIME_SYSTEM_PROMPT = os.environ.get(
     "REALTIME_SYSTEM_PROMPT",
-    "Du bist eine deutschsprachige Telefonassistenz. "
-    "Sprich akzentfrei auf Hochdeutsch (de-DE), kurze Sätze, klare Artikulation. "
-    "Benutze deutsche Zahlen- und Datumsformate. Frage kurz nach, wenn etwas unklar ist."
+    "Antworte ausschließlich auf Deutsch (Hochdeutsch, de-DE). "
+    "Sprich klar und kurz. Frage nach, wenn etwas unklar ist."
 )
 TWIML_GREETING = (os.environ.get("TWIML_GREETING") or "").strip()
 STREAM_WS_URL = (os.environ.get("STREAM_WS_URL") or "").strip()
@@ -29,8 +27,9 @@ AUTO_GREETING = (os.environ.get("AUTO_GREETING") or "").strip()
 # ========= APP =========
 app = FastAPI(title="Twilio ↔ OpenAI Realtime")
 
-@app.get("/healthz")
+@app.api_route("/healthz", methods=["GET", "HEAD"])
 async def healthz():
+    # HEAD und GET -> 200 OK (wichtig für Render-Healthcheck)
     return PlainTextResponse("ok")
 
 @app.get("/")
@@ -43,7 +42,7 @@ async def root_head():
 
 @app.get("/diag")
 async def diag():
-    """Quick server-side connectivity test to OpenAI Realtime."""
+    """Schnelltest: Verbindet zu OpenAI Realtime und wartet auf session.created/session.updated."""
     url = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}"
     headers = [("Authorization", f"Bearer {OPENAI_API_KEY}")]
     try:
@@ -57,16 +56,17 @@ async def diag():
             "session": {
                 "type": "realtime",
                 "model": OPENAI_REALTIME_MODEL,
-                "output_modalities": ["audio"],                "audio": {
+                "output_modalities": ["audio"],
+                "audio": {
                     "input": {"format": {"type": "audio/pcmu"}, "turn_detection": {"type": "server_vad"}},
                     "output": {"format": {"type": "audio/pcmu"}, "voice": TWILIO_VOICE}
                 }
             }
         }))
-        # Wait for session.updated
+        # Warte auf erste Server-Antwort
         raw = await asyncio.wait_for(ws.recv(), timeout=8)
         await ws.close()
-        return PlainTextResponse("diag: ok - " + raw[:200])
+        return PlainTextResponse("diag: ok - " + raw[:240])
     except Exception as e:
         return PlainTextResponse("diag: failed - " + repr(e), status_code=500)
 
@@ -101,7 +101,7 @@ async def telefon_live(request: Request):
 
 # ========= Bridge =========
 class CallSession:
-    """Bridge Twilio Media Streams (mu-law/8kHz) <-> OpenAI Realtime (GA)."""
+    """Bridge Twilio Media Streams (μ-law/8kHz) ↔ OpenAI Realtime (GA)."""
     def __init__(self, twilio_ws: WebSocket):
         self.twilio_ws = twilio_ws
         self.oai_ws: Optional[websockets.WebSocketClientProtocol] = None
@@ -122,14 +122,15 @@ class CallSession:
         headers = [("Authorization", f"Bearer {OPENAI_API_KEY}")]
         self.oai_ws = await self._ws_connect(url, headers)
 
-        # Configure session
+        # Session konfigurieren
         session_update = {
             "type": "session.update",
             "session": {
                 "type": "realtime",
                 "model": OPENAI_REALTIME_MODEL,
                 "instructions": REALTIME_SYSTEM_PROMPT,
-                "output_modalities": ["audio"],                "audio": {
+                "output_modalities": ["audio"],
+                "audio": {
                     "input": {"format": {"type": "audio/pcmu"}, "turn_detection": {"type": "server_vad"}},
                     "output": {"format": {"type": "audio/pcmu"}, "voice": TWILIO_VOICE}
                 },
@@ -137,8 +138,8 @@ class CallSession:
         }
         await self.oai_ws.send(json.dumps(session_update))
 
-        # Wait for session.updated BEFORE forwarding Twilio audio
-        for _ in range(15):  # ~30s
+        # Warte auf session.updated, erst dann Audio weiterleiten
+        for _ in range(20):  # ~40s
             raw = await asyncio.wait_for(self.oai_ws.recv(), timeout=2)
             try:
                 evt = json.loads(raw)
@@ -147,7 +148,6 @@ class CallSession:
             if evt.get("type") == "session.updated":
                 print("OpenAI session.updated received")
                 self.oai_ready = True
-                # Optional one-time greeting
                 if AUTO_GREETING:
                     await self.oai_ws.send(json.dumps({
                         "type": "response.create",
@@ -191,6 +191,7 @@ class CallSession:
                     media = data.get("media", {})
                     payload = media.get("payload")
                     if payload:
+                        # Barge-in: wenn Assistent spricht und der Anrufer spricht rein
                         if self.assistant_speaking and not self._barge_in:
                             await self._twilio_clear()
                             try:
@@ -228,7 +229,6 @@ class CallSession:
                         delta = evt.get("delta")
                         if delta:
                             self.assistant_speaking = True
-                            # debug
                             print("OpenAI audio delta", len(delta))
                             await self.twilio_ws.send_text(json.dumps({"event": "media", "media": {"payload": delta}}))
                     elif t == "response.completed":
@@ -260,7 +260,7 @@ class CallSession:
 
 @app.websocket("/media-stream")
 async def media_stream(ws: WebSocket):
-    # Accept Twilio's 'audio' subprotocol for media streams
+    # Twilio erwartet Subprotokoll "audio"
     try:
         requested = ws.headers.get('sec-websocket-protocol')
     except Exception:
