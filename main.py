@@ -40,7 +40,7 @@ def twiml_continue(bot_text: str) -> Response:
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
         + twiml_say(bot_text)
-        + '<Pause length="0.5"/>'
+        + '<Pause length="0.2"/>'
         + twiml_record()
         + "</Response>"
     )
