@@ -11,6 +11,9 @@ import uvicorn
 import websockets
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+OPENAI_REALTIME_MODEL = os.environ.get("OPENAI_REALTIME_MODEL", "gpt-realtime")
+TWILIO_VOICE = os.environ.get("TWILIO_VOICE", "verse")
+REALTIME_SYSTEM_PROMPT = os.environ.get("REALTIME_SYSTEM_PROMPT", "Du bist ein freundlicher deutschsprachiger Telefonassistent.")
 if not OPENAI_API_KEY:
     raise RuntimeError("Please set OPENAI_API_KEY in your environment.")
 
@@ -85,12 +88,10 @@ class CallSession:
             "type": "session.update",
             "session": {
                 "type": "realtime",
-                "model": "gpt-realtime",
+                "model": OPENAI_REALTIME_MODEL,
                 "output_modalities": ["audio"],
                 "instructions": (
-                    "Du bist ein freundlicher deutschsprachiger Telefonassistent von Wowona. "
-                    "Begrüße kurz und hilf knapp und präzise. "
-                    "Falls du etwas nicht sicher weißt, frage nach."
+                    REALTIME_SYSTEM_PROMPT
                 ),
                 "audio": {
                     "input": {
@@ -99,7 +100,7 @@ class CallSession:
                     },
                     "output": {
                         "format": {"type": "audio/pcmu"},
-                        "voice": "alloy"
+                        "voice": TWILIO_VOICE
                     }
                 },
             }
