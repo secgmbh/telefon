@@ -60,17 +60,24 @@ def antwort():
         transcript = getattr(tr, "text", None) or (tr.get("text") if isinstance(tr, dict) else "")
         print("Transkript:", transcript)
 
-        # --- Kurze Zusammenfassung / Antwort ---
+        # --- Direkte Antwort ---
+        reply_style = os.getenv("REPLY_STYLE", "du")  # "du" | "sie"
+        tone = "freundlich, klar, lösungsorientiert"
+        addr = "du" if reply_style.lower() == "du" else "Sie"
         prompt = (
-            "Fasse die Kernbotschaft des folgenden Telefonmitschnitts in 1-2 Sätzen zusammen "
-            "und schlage, wenn sinnvoll, die nächsten Schritte vor. Antworte auf Deutsch.\n\n"
-            f"Transkript: {transcript}"
+            f"Antworte direkt auf das Anliegen des Anrufers in natürlichem Deutsch (Anrede: {addr}). "
+            f"Ziel: eine hilfreiche, konkrete Antwort mit ggf. 1-2 gezielten Rückfragen, keine Zusammenfassung. "
+            f"Sei {tone}. Wenn Informationen fehlen, frage präzise nach. "
+            f"Halte dich an 1-3 Sätze, außer es werden konkrete Schritte verlangt.
+
+"
+            f"Gesagter Inhalt (Roh-Transkript): {transcript}"
         )
         resp = client.responses.create(
             model="gpt-4o-mini",
             input=[{"role": "user", "content": prompt}]
         )
-        bot_text = extract_text(resp) or "Vielen Dank für Ihre Nachricht. Wir melden uns bald bei Ihnen."
+        bot_text = extract_text(resp) or "Danke dir! Kannst du bitte noch kurz präzisieren, wobei ich dir genau helfen soll?"
 
         return twilio_response(bot_text)
 
