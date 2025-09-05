@@ -27,7 +27,7 @@ def telefon():
     response = """<?xml version="1.0" encoding="UTF-8"?>
     <Response>
         <Say language="de-DE">Willkommen bei wowona. Mein Name ist Maria. Wie kann ich Dir helfen?</Say>
-        <Record action="/antwort" maxLength="30" playBeep="false" transcribe="false" />
+        <Record action="/antwort" method="POST" maxLength="20" timeout="2" finishOnKey="#" trim="trim-silence" playBeep="false" transcribe="false" />
     </Response>"""
     return Response(response, mimetype="text/xml")
 
@@ -39,16 +39,35 @@ def antwort():
         if not recording_url:
             return twilio_response("Es wurde keine Aufnahme übermittelt.")
 
-        mp3_url = recording_url + ".mp3"
-        audio_response = requests.get(mp3_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), timeout=30)
-        status = audio_response.status_code
-        print("Twilio Download Status:", status)
-        audio_response.raise_for_status()
+        # Ziehe die WAV sofort – MP3-Erzeugung bei Twilio kann dauern
+        wav_url = recording_url + ".wav"
 
-        audio_path = "recording.mp3"
-        with open(audio_path, "wb") as f:
-            f.write(audio_response.content)
-        print(f"Aufnahme gespeichert als {audio_path} ({len(audio_response.content)} Bytes)")
+        # Kleiner, schneller Retry, falls Twilio die Datei 1-2 Sekunden noch verarbeitet
+        content = None
+        for _ in range(6):  # bis ~1.2s bei 0.2s Sleep
+            r = requests.get(wav_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), timeout=10)
+            if r.status_code == 200 and int(r.headers.get("Content-Length", 1)) > 1:
+                content = r.content
+                break
+            import time; time.sleep(0.2)
+        if content is None:
+            # letzter Versuch ohne Retry-Loop
+            r = requests.get(wav_url, auth=(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN), timeout=10)
+            r.raise_for_status()
+            content = r.content
+
+        print("WAV Bytes:", len(content))
+
+        # --- Transkription ohne Dateisystem ---
+        import io
+        file_like = io.BytesIO(content)
+        file_like.name = "recording.wav"  # Name hilft manchen SDKs
+
+        tr = client.audio.transcriptions.create(
+            model=OPENAI_TRANSCRIBE_MODEL,
+            file=("recording.wav", file_like),
+            language="de",
+        )
 
         # --- Transkription ---
         with open(audio_path, "rb") as f:
