@@ -47,25 +47,16 @@ def ulaw_decode_bytes(ulaw_bytes: bytes) -> bytes:
     pcm = np.clip(pcm, -32768, 32767).astype(np.int16)
     return pcm.tobytes()
 
-
 def _ulaw_segment_scalar(x: int) -> int:
     """Bestimme Segment (0..7) für μ-law, scalar."""
-    if x >= 0x4000:
-        return 7
-    if x >= 0x2000:
-        return 6
-    if x >= 0x1000:
-        return 5
-    if x >= 0x0800:
-        return 4
-    if x >= 0x0400:
-        return 3
-    if x >= 0x0200:
-        return 2
-    if x >= 0x0100:
-        return 1
+    if x >= 0x4000: return 7
+    if x >= 0x2000: return 6
+    if x >= 0x1000: return 5
+    if x >= 0x0800: return 4
+    if x >= 0x0400: return 3
+    if x >= 0x0200: return 2
+    if x >= 0x0100: return 1
     return 0
-
 
 def ulaw_encode_bytes(pcm_bytes: bytes) -> bytes:
     """Encode PCM16 little-endian (int16) -> G.711 μ-law (8-bit)"""
@@ -86,27 +77,24 @@ def ulaw_encode_bytes(pcm_bytes: bytes) -> bytes:
         ulaw[i] = u
     return ulaw.tobytes()
 
-
-# ----------------- TwiML endpoints -----------------
+# ----------------- TwiML endpoint -----------------
 @app.api_route("/telefon_live", methods=["GET", "POST"])
 async def telefon_live():
-    # Twilio ruft diesen Webhook bei Anruf (POST) auf. GET ist nur zum Debuggen im Browser.
+    # Twilio ruft diesen Webhook bei Anruf (POST) auf. GET nur zum Debuggen im Browser.
     wss_url = os.getenv("TWILIO_STREAM_WSS") or ("wss://YOUR_DOMAIN" + STREAM_WSS_PATH)
     print("TwiML requested. Using stream URL:", wss_url)
-    xml = f"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say language=\"de-DE\" voice=\"Polly.Vicki-Neural\">Willkommen bei wowona Live. Stelkle deine Frage</Say>
+  <Say language="de-DE" voice="Polly.Vicki-Neural">Willkommen bei wowona Live. Einen Moment bitte…</Say>
   <Connect>
-    <Stream url=\"{wss_url}\" />
+    <Stream url="{wss_url}" />
   </Connect>
 </Response>"""
     return Response(content=xml, media_type="text/xml")
 
-
 @app.get("/")
 async def root():
     return Response(content="OK", media_type="text/plain")
-
 
 # ----------------- WebSocket Bridge -----------------
 class Bridge:
@@ -254,7 +242,6 @@ class Bridge:
         try:
             await self.twilio_ws.send_text(json.dumps(obj))
             if obj.get("event") == "media":
-                # nur Größe loggen – Payload ist Base64
                 payload = obj.get("media", {}).get("payload", "")
                 print("WS TX media (bytes):", len(payload))
             else:
@@ -282,11 +269,20 @@ class Bridge:
         except Exception as e:
             print("Twilio WS close error:", repr(e))
 
-
 @app.websocket("/twilio-stream")
 async def twilio_stream(ws: WebSocket):
-    print("WS: /twilio-stream accepted")
-    await ws.accept()
+    # Twilio erwartet, dass wir das Subprotocol spiegeln: audio.stream.twilio.com
+    headers_dict = dict(ws.headers)
+    print("WS headers:", headers_dict)
+    subproto = ws.headers.get("sec-websocket-protocol")
+    print("WS: /twilio-stream handshake subprotocol =", subproto)
+    try:
+        await ws.accept(subprotocol=subproto)  # entscheidend!
+        print("WS: accepted with subprotocol")
+    except Exception as e:
+        print("WS accept error:", repr(e))
+        return
+
     bridge = Bridge(ws)
     try:
         await bridge.start()
@@ -294,7 +290,6 @@ async def twilio_stream(ws: WebSocket):
     except Exception as e:
         print("Bridge error:", repr(e))
         await bridge.close()
-
 
 # Für lokalen Start:
 if __name__ == "__main__":
