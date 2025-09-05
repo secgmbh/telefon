@@ -31,7 +31,7 @@ def telefon():
     </Response>"""
     return Response(response, mimetype="text/xml")
 
-# 2) Nach der Aufnahme: MP3 holen → OpenAI transkribieren → kurze KI-Antwort
+# 2) Nach der Aufnahme: MP3 holen → OpenAI transkribieren → direkte KI-Antwort
 @app.route("/antwort", methods=["POST"])
 def antwort():
     try:
@@ -68,9 +68,7 @@ def antwort():
             f"Antworte direkt auf das Anliegen des Anrufers in natürlichem Deutsch (Anrede: {addr}). "
             f"Ziel: eine hilfreiche, konkrete Antwort mit ggf. 1-2 gezielten Rückfragen, keine Zusammenfassung. "
             f"Sei {tone}. Wenn Informationen fehlen, frage präzise nach. "
-            f"Halte dich an 1-3 Sätze, außer es werden konkrete Schritte verlangt.
-
-"
+            f"Halte dich an 1-3 Sätze, außer es werden konkrete Schritte verlangt.\n\n"
             f"Gesagter Inhalt (Roh-Transkript): {transcript}"
         )
         resp = client.responses.create(
