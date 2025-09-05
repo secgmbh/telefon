@@ -2,10 +2,10 @@ import os
 import json
 import time
 import base64
-import audioop
 import asyncio
 from typing import Optional
 
+import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 from dotenv import load_dotenv
@@ -16,8 +16,8 @@ load_dotenv()
 # --- ENV ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview-2025-06-03")
-STREAM_WSS_PATH = os.getenv("TWILIO_STREAM_PATH", "/twilio-stream")  # must match your TwiML
-VOICE = os.getenv("TWILIO_VOICE", "alloy")  # OpenAI voice name (e.g., "alloy")
+STREAM_WSS_PATH = os.getenv("TWILIO_STREAM_PATH", "/twilio-stream")  # muss zu deiner TwiML passen
+VOICE = os.getenv("TWILIO_VOICE", "alloy")  # OpenAI Realtime voice
 SYSTEM_PROMPT = os.getenv(
     "REALTIME_SYSTEM_PROMPT",
     "Du bist Maria, eine freundliche, präzise deutschsprachige Assistentin. Antworte kurz und konkret.",
@@ -25,15 +25,70 @@ SYSTEM_PROMPT = os.getenv(
 
 app = FastAPI()
 
+# ---------- μ-law <-> PCM16 @ 8kHz (ohne audioop) ----------
+_ULAW_BIAS = 0x84  # 132
+_ULAW_CLIP = 32635
+
+def ulaw_decode_bytes(ulaw_bytes: bytes) -> bytes:
+    """Decode G.711 μ-law (8-bit) -> PCM16 little-endian (int16)"""
+    u = np.frombuffer(ulaw_bytes, dtype=np.uint8)
+    u = np.bitwise_xor(u, 0xFF)
+
+    sign = (u & 0x80) != 0
+    exp = (u >> 4) & 0x07
+    mant = u & 0x0F
+
+    # sample = ((mant << 4) + 0x08) << exp + 0x84  (anschließend -0x84, mit Vorzeichen)
+    magnitude = ((mant.astype(np.int32) << 4) + 0x08) << exp
+    magnitude = magnitude + _ULAW_BIAS
+    magnitude = magnitude - _ULAW_BIAS
+
+    pcm = magnitude.astype(np.int32)
+    pcm[sign] = -pcm[sign]
+    pcm = np.clip(pcm, -32768, 32767).astype(np.int16)
+    return pcm.tobytes()
+
+def _ulaw_segment_scalar(x: int) -> int:
+    """Bestimme Segment (0..7) für μ-law, scalar."""
+    # x >= 0, already biased
+    if x >= 0x4000: return 7
+    if x >= 0x2000: return 6
+    if x >= 0x1000: return 5
+    if x >= 0x0800: return 4
+    if x >= 0x0400: return 3
+    if x >= 0x0200: return 2
+    if x >= 0x0100: return 1
+    return 0
+
+def ulaw_encode_bytes(pcm_bytes: bytes) -> bytes:
+    """Encode PCM16 little-endian (int16) -> G.711 μ-law (8-bit)"""
+    x = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.int32)
+    # Clamp
+    x = np.clip(x, -_ULAW_CLIP, _ULAW_CLIP)
+    # Sign & magnitude
+    sign = x < 0
+    x = np.abs(x).astype(np.int32)
+    x = x + _ULAW_BIAS
+    # Segment + mantissa per sample (scalar loop; Twilio frames sind klein, loop ist ok)
+    ulaw = np.empty(x.shape[0], dtype=np.uint8)
+    for i in range(x.shape[0]):
+        xi = x[i]
+        seg = _ulaw_segment_scalar(xi)
+        mant = (xi >> (seg + 3)) & 0x0F
+        u = ((seg << 4) | mant)
+        u ^= 0xFF  # complement
+        if sign[i]:
+            u |= 0x80
+        ulaw[i] = u
+    return ulaw.tobytes()
+
 # ----------------- TwiML endpoints -----------------
 @app.post("/telefon_live")
 async def telefon_live():
-    # Twilio will fetch this to start the bidirectional stream
-    # Make sure your service is reachable via TLS; on Render you'll have HTTPS/WSS by default
-    # Build WSS url from host header for convenience
+    # Twilio ruft diesen Webhook an (Voice: A call comes in -> POST)
     wss_url = os.getenv("TWILIO_STREAM_WSS")
     if not wss_url:
-        # Try to infer from request's host via a dummy placeholder; you can hardcode in .env
+        # Fallback – bitte in .env setzen
         wss_url = "wss://YOUR_DOMAIN" + STREAM_WSS_PATH
 
     xml = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -49,10 +104,7 @@ async def telefon_live():
 async def root():
     return Response(content="OK", media_type="text/plain")
 
-
 # ----------------- WebSocket Bridge -----------------
-# Twilio <-> OpenAI Realtime in one connection
-
 class Bridge:
     def __init__(self, twilio_ws: WebSocket):
         self.twilio_ws = twilio_ws
@@ -70,33 +122,31 @@ class Bridge:
             "OpenAI-Beta": "realtime=v1",
         }
         self.oai_ws = await websockets.connect(url, extra_headers=headers, ping_interval=20)
-        # Set session defaults: instructions + request audio output by default
+        # Session: 8 kHz PCM16 für Ein- und Ausgabe -> kein Resampling nötig
         await self.oai_ws.send(json.dumps({
             "type": "session.update",
             "session": {
                 "instructions": SYSTEM_PROMPT,
                 "modalities": ["audio", "text"],
                 "voice": VOICE,
-                "input_audio_format": {"type": "pcm16", "sample_rate_hz": 16000},
-                "output_audio_format": {"type": "pcm16", "sample_rate_hz": 16000},
+                "input_audio_format": {"type": "pcm16", "sample_rate_hz": 8000},
+                "output_audio_format": {"type": "pcm16", "sample_rate_hz": 8000},
                 "language": "de-DE",
             },
         }))
 
     async def start(self):
         await self.open_openai()
-        # Task: read from OpenAI and send to Twilio
         asyncio.create_task(self._pipe_openai_to_twilio())
-        # Task: periodic commit if short pause is detected
         self.commit_task = asyncio.create_task(self._auto_commit_loop())
 
     async def _auto_commit_loop(self):
-        # Commit input when we detect ~250ms Pause → keeps latency <~1s
+        # Commit nach ~250 ms Stille -> niedrige Latenz
         while not self.closed:
             await asyncio.sleep(0.1)
             if not self.last_media_ts:
                 continue
-            if time.time() - self.last_media_ts > 0.25:  # ~250 ms Pause
+            if time.time() - self.last_media_ts > 0.25:
                 await self._commit_and_request_response()
                 self.last_media_ts = 0.0
 
@@ -105,7 +155,10 @@ class Bridge:
             return
         try:
             await self.oai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-            await self.oai_ws.send(json.dumps({"type": "response.create", "response": {"modalities": ["audio", "text"]}}))
+            await self.oai_ws.send(json.dumps({
+                "type": "response.create",
+                "response": {"modalities": ["audio", "text"]}
+            }))
         except Exception:
             pass
 
@@ -120,17 +173,18 @@ class Bridge:
                 elif event == "media":
                     ulaw_b64 = data["media"]["payload"]
                     ulaw = base64.b64decode(ulaw_b64)
-                    pcm8k = audioop.ulaw2lin(ulaw, 2)  # μ-law -> PCM16 @8kHz
-                    pcm16k, _ = audioop.ratecv(pcm8k, 2, 1, 8000, 16000, None)
-                    # If caller speaks while we're playing, barge-in: clear any playback
+                    pcm16_8k = ulaw_decode_bytes(ulaw)
+                    # Barge-in: falls wir gerade spielen, Playback abbrechen
                     if self.playing_audio and self.stream_sid:
                         await self._twilio_send({"event": "clear", "streamSid": self.stream_sid})
                         self.playing_audio = False
-                    # Append to OpenAI
-                    await self.oai_ws.send(json.dumps({"type": "input_audio_buffer.append", "audio": base64.b64encode(pcm16k).decode()}))
+                    # an OpenAI anhängen
+                    await self.oai_ws.send(json.dumps({
+                        "type": "input_audio_buffer.append",
+                        "audio": base64.b64encode(pcm16_8k).decode(),
+                    }))
                     self.last_media_ts = time.time()
                 elif event == "stop":
-                    # Final commit when stream ends
                     await self._commit_and_request_response()
                     break
         except WebSocketDisconnect:
@@ -139,7 +193,6 @@ class Bridge:
             await self.close()
 
     async def _pipe_openai_to_twilio(self):
-        # Send OpenAI audio chunks back to Twilio as μ-law 8k media frames
         if not self.oai_ws:
             return
         try:
@@ -153,10 +206,8 @@ class Bridge:
                     b64 = data.get("delta") or data.get("audio")
                     if not b64:
                         continue
-                    pcm16 = base64.b64decode(b64)
-                    # convert to μ-law 8k for Twilio playback
-                    pcm8k, _ = audioop.ratecv(pcm16, 2, 1, 16000, 8000, None)
-                    ulaw = audioop.lin2ulaw(pcm8k, 2)
+                    pcm16_8k = base64.b64decode(b64)
+                    ulaw = ulaw_encode_bytes(pcm16_8k)
                     if self.stream_sid:
                         await self._twilio_send({
                             "event": "media",
@@ -165,9 +216,12 @@ class Bridge:
                         })
                         self.playing_audio = True
                 elif t in ("response.audio.done", "response.output_audio.done"):
-                    # Mark end of assistant turn for debugging
                     if self.stream_sid:
-                        await self._twilio_send({"event": "mark", "streamSid": self.stream_sid, "mark": {"name": "assistant_turn_done"}})
+                        await self._twilio_send({
+                            "event": "mark",
+                            "streamSid": self.stream_sid,
+                            "mark": {"name": "assistant_turn_done"},
+                        })
                         self.playing_audio = False
         except Exception:
             pass
@@ -197,7 +251,6 @@ class Bridge:
         except Exception:
             pass
 
-
 @app.websocket("/twilio-stream")
 async def twilio_stream(ws: WebSocket):
     await ws.accept()
@@ -205,9 +258,7 @@ async def twilio_stream(ws: WebSocket):
     await bridge.start()
     await bridge.receive_from_twilio()
 
-
-# --------------- Run (for local dev) ---------------
-# On Render, use: gunicorn -k uvicorn.workers.UvicornWorker main:app
+# Für lokalen Start:
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
