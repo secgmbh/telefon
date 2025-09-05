@@ -131,6 +131,8 @@ class CallSession:
         })
 
     async def _oai_finish_input(self):
+        # Commit the current input audio buffer to trigger server VAD turn end
+        await self._oai_send_json({"type": "input_audio_buffer.commit"})
 
     async def _twilio_clear(self):
         """Tell Twilio to clear any buffered outbound audio (barge-in)."""
