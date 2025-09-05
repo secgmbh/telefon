@@ -23,6 +23,10 @@ REALTIME_SYSTEM_PROMPT = os.environ.get(
 TWIML_GREETING = (os.environ.get("TWIML_GREETING") or "").strip()
 STREAM_WS_URL = (os.environ.get("STREAM_WS_URL") or "").strip()
 AUTO_GREETING = (os.environ.get("AUTO_GREETING") or "").strip()
+POST_GREETING_MUTE_MS = int(os.environ.get("POST_GREETING_MUTE_MS", "1200"))
+VAD_THRESHOLD = float(os.environ.get("VAD_THRESHOLD", "0.7"))
+VAD_SILENCE_MS = int(os.environ.get("VAD_SILENCE_MS", "900"))
+VAD_PREFIX_MS = int(os.environ.get("VAD_PREFIX_MS", "250"))
 
 # ========= APP =========
 app = FastAPI(title="Twilio ↔ OpenAI Realtime")
@@ -58,7 +62,17 @@ async def diag():
                 "model": OPENAI_REALTIME_MODEL,
                 "output_modalities": ["audio"],
                 "audio": {
-                    "input": {"format": {"type": "audio/pcmu"}, "turn_detection": {"type": "server_vad"}},
+                    "input": {
+                        "format": {"type": "audio/pcmu"},
+                        "turn_detection": {
+                            "type": "server_vad",
+                            "threshold": VAD_THRESHOLD,
+                            "silence_duration_ms": VAD_SILENCE_MS,
+                            "prefix_padding_ms": VAD_PREFIX_MS,
+                            "create_response": True,
+                            "interrupt_response": True
+                        }
+                    },
                     "output": {"format": {"type": "audio/pcmu"}, "voice": TWILIO_VOICE}
                 }
             }
@@ -136,6 +150,7 @@ class CallSession:
         self.twilio_stream_sid: Optional[str] = None
         self.assistant_speaking = False
         self._barge_in = False
+        self._mute_until = 0.0
 
     async def _ws_connect(self, url: str, headers):
         try:
@@ -157,7 +172,17 @@ class CallSession:
                 "instructions": REALTIME_SYSTEM_PROMPT,
                 "output_modalities": ["audio"],
                 "audio": {
-                    "input": {"format": {"type": "audio/pcmu"}, "turn_detection": {"type": "server_vad"}},
+                    "input": {
+                        "format": {"type": "audio/pcmu"},
+                        "turn_detection": {
+                            "type": "server_vad",
+                            "threshold": VAD_THRESHOLD,
+                            "silence_duration_ms": VAD_SILENCE_MS,
+                            "prefix_padding_ms": VAD_PREFIX_MS,
+                            "create_response": True,
+                            "interrupt_response": True
+                        }
+                    },
                     "output": {"format": {"type": "audio/pcmu"}, "voice": TWILIO_VOICE}
                 },
             }
@@ -179,6 +204,8 @@ class CallSession:
                         "type": "response.create",
                         "response": {"instructions": AUTO_GREETING}
                     }))
+                # short echo-protection: ignore inbound audio right after greeting
+                self._mute_until = asyncio.get_event_loop().time() + (POST_GREETING_MUTE_MS / 1000.0)
                 break
             if evt.get("type") == "error":
                 raise RuntimeError(f"OpenAI error: {evt.get('error')}")
@@ -214,6 +241,9 @@ class CallSession:
                     print("Twilio WS start:", self.twilio_stream_sid)
                 elif event == "media":
                     if not self.oai_ready:
+                        continue
+                    # drop early echo/noise right after greeting
+                    if asyncio.get_event_loop().time() < getattr(self, "_mute_until", 0.0):
                         continue
                     media = data.get("media", {})
                     payload = media.get("payload")
@@ -255,6 +285,7 @@ class CallSession:
                     t = evt.get("type")
                     if t == "response.created":
                         self._barge_in = False
+        self._mute_until = 0.0
                     elif t == "response.output_audio.delta":
                         delta = evt.get("delta")
                         if delta:
