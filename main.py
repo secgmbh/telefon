@@ -114,16 +114,15 @@ class Bridge:
             self.oai_ws = await websockets.connect(url, extra_headers=headers, ping_interval=20)
             print("OAI: connected")
             await self.oai_ws.send(json.dumps({
-                "type": "session.update",
-                "session": {
-                    "instructions": SYSTEM_PROMPT,
-                    "modalities": ["audio", "text"],
-                    "voice": VOICE,
-                    "input_audio_format": {"type": "pcm16", "sample_rate_hz": 8000},
-                    "output_audio_format": {"type": "pcm16", "sample_rate_hz": 8000},
-                    "language": "de-DE",
-                },
-            }))
+    "type": "session.update",
+    "session": {
+        "instructions": SYSTEM_PROMPT,
+        "modalities": ["audio", "text"],
+        "voice": VOICE,
+        "input_audio_format": {"type": "pcm16", "sample_rate_hz": 8000},
+        "output_audio_format": {"type": "pcm16", "sample_rate_hz": 8000}
+    },
+}))
             print("OAI: session.update sent")
         except Exception as e:
             print("OAI: failed to connect or configure →", repr(e))
