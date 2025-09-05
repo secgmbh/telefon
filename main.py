@@ -87,13 +87,23 @@ class CallSession:
     async def _connect_openai(self):
         url = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}"
         headers = [("Authorization", f"Bearer {OPENAI_API_KEY}")]
-        self.oai_ws = await websockets.connect(
-            url,
-            extra_headers=headers,
-            ping_interval=20,
-            ping_timeout=20,
-            max_size=10 * 1024 * 1024,
-        )
+        try:
+            self.oai_ws = await websockets.connect(
+                url,
+                extra_headers=headers,
+                ping_interval=20,
+                ping_timeout=20,
+                max_size=10 * 1024 * 1024,
+            )
+        except TypeError:
+            # websockets>=13 renamed 'extra_headers' to 'additional_headers'
+            self.oai_ws = await websockets.connect(
+                url,
+                additional_headers=headers,
+                ping_interval=20,
+                ping_timeout=20,
+                max_size=10 * 1024 * 1024,
+            )
         session_update = {
             "type": "session.update",
             "session": {
