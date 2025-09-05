@@ -24,6 +24,7 @@ REALTIME_SYSTEM_PROMPT = os.environ.get(
 )
 TWIML_GREETING = (os.environ.get("TWIML_GREETING") or "").strip()
 STREAM_WS_URL = (os.environ.get("STREAM_WS_URL") or "").strip()
+AUTO_GREETING = (os.environ.get("AUTO_GREETING") or "").strip()
 
 # ========= APP =========
 app = FastAPI(title="Twilio ↔ OpenAI Realtime")
@@ -56,9 +57,7 @@ async def diag():
             "session": {
                 "type": "realtime",
                 "model": OPENAI_REALTIME_MODEL,
-                "output_modalities": ["audio"],
-                "input_audio_transcription": {"enabled": True, "language": "de"},
-                "audio": {
+                "output_modalities": ["audio"],                "audio": {
                     "input": {"format": {"type": "audio/pcmu"}, "turn_detection": {"type": "server_vad"}},
                     "output": {"format": {"type": "audio/pcmu"}, "voice": TWILIO_VOICE}
                 }
@@ -77,11 +76,11 @@ def _twiml(ws_url: str, greeting: Optional[str]) -> str:
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say language="de-DE">{greeting}</Say>
-  <Connect><Stream url="{ws_url}"/></Connect>
+  <Connect><Stream url="{ws_url}" track="both"/></Connect>
 </Response>"""
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Connect><Stream url="{ws_url}"/></Connect>
+  <Connect><Stream url="{ws_url}" track="both"/></Connect>
 </Response>"""
 
 def _infer_ws_url(request: Request) -> str:
@@ -130,9 +129,7 @@ class CallSession:
                 "type": "realtime",
                 "model": OPENAI_REALTIME_MODEL,
                 "instructions": REALTIME_SYSTEM_PROMPT,
-                "output_modalities": ["audio"],
-                "input_audio_transcription": {"enabled": True, "language": "de"},
-                "audio": {
+                "output_modalities": ["audio"],                "audio": {
                     "input": {"format": {"type": "audio/pcmu"}, "turn_detection": {"type": "server_vad"}},
                     "output": {"format": {"type": "audio/pcmu"}, "voice": TWILIO_VOICE}
                 },
@@ -148,7 +145,14 @@ class CallSession:
             except Exception:
                 continue
             if evt.get("type") == "session.updated":
+                print("OpenAI session.updated received")
                 self.oai_ready = True
+                # Optional one-time greeting
+                if AUTO_GREETING:
+                    await self.oai_ws.send(json.dumps({
+                        "type": "response.create",
+                        "response": {"instructions": AUTO_GREETING}
+                    }))
                 break
             if evt.get("type") == "error":
                 raise RuntimeError(f"OpenAI error: {evt.get('error')}")
@@ -224,6 +228,8 @@ class CallSession:
                         delta = evt.get("delta")
                         if delta:
                             self.assistant_speaking = True
+                            # debug
+                            print("OpenAI audio delta", len(delta))
                             await self.twilio_ws.send_text(json.dumps({"event": "media", "media": {"payload": delta}}))
                     elif t == "response.completed":
                         self.assistant_speaking = False
