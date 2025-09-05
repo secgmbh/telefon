@@ -76,13 +76,14 @@ def antwort():
         tone = "freundlich, klar, lösungsorientiert"
         addr = "du" if reply_style.lower() == "du" else "Sie"
         prompt = (
+            (
             f"Antworte direkt auf das Anliegen des Anrufers in natürlichem Deutsch (Anrede: {addr}). "
             f"Ziel: eine hilfreiche, konkrete Antwort mit ggf. 1-2 gezielten Rückfragen, keine Zusammenfassung. "
-            f"Sei {tone}. Wenn Informationen fehlen, frage präzise nach. "
-            f"Halte dich an 1-3 Sätze, außer es werden konkrete Schritte verlangt.
+            f"Sei {tone}. Wenn Informationen fehlen, frage präzise nach. Halte dich an 1-3 Sätze, außer es werden konkrete Schritte verlangt.
 
 "
             f"Gesagter Inhalt (Roh-Transkript): {transcript}"
+        )
         )
 
         resp = client.responses.create(
