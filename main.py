@@ -102,6 +102,15 @@ class Bridge:
         self.closed = False
         self.seen_start = False
 
+        # Neu: zeit-/mengenbasierter Commit
+        self.bytes_buffered: int = 0
+        self.last_commit_ts: float = 0.0
+
+        # Schwellen (8 kHz, 16 bit => ~16kB/s). 8kB ~ 0,5 s Audio.
+        self.BUFFER_BYTES_THRESHOLD = 8000     # commit wenn >= 0.5 s Audio gesammelt
+        self.FORCE_COMMIT_INTERVAL = 1.0       # spätestens nach 1.0 s committen
+        self.SILENCE_COMMIT_GAP = 0.20         # bei ~200 ms Pause committen
+
     async def open_openai(self):
         url = f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}"
         headers = {
@@ -114,7 +123,6 @@ class Bridge:
             print("OAI: connecting →", url)
             self.oai_ws = await websockets.connect(url, extra_headers=headers, ping_interval=20)
             print("OAI: connected")
-            # WICHTIG: formate als Strings, kein Objekt
             await self.oai_ws.send(json.dumps({
                 "type": "session.update",
                 "session": {
@@ -145,13 +153,24 @@ class Bridge:
 
     async def _auto_commit_loop(self):
         while not self.closed:
-            await asyncio.sleep(0.1)
-            if not self.last_media_ts:
-                continue
-            if time.time() - self.last_media_ts > 0.20:  # 200 ms für niedrige Latenz
-                print("Auto-commit: ~200ms pause detected → committing & requesting response")
+            await asyncio.sleep(0.05)
+            now = time.time()
+
+            # 1) Commit bei Stille (~200 ms ohne neue Frames)
+            if self.last_media_ts and (now - self.last_media_ts > self.SILENCE_COMMIT_GAP) and self.bytes_buffered > 0:
+                print("Auto-commit (silence): committing after ~200ms pause")
                 await self._commit_and_request_response()
+                self.bytes_buffered = 0
+                self.last_commit_ts = now
                 self.last_media_ts = 0.0
+                continue
+
+            # 2) Spätestens nach 1.0 s committen, wenn genügend Audio gesammelt
+            if self.bytes_buffered >= self.BUFFER_BYTES_THRESHOLD and (now - self.last_commit_ts) >= self.FORCE_COMMIT_INTERVAL:
+                print(f"Auto-commit (force): bytes_buffered={self.bytes_buffered}, dt={now - self.last_commit_ts:.2f}s")
+                await self._commit_and_request_response()
+                self.bytes_buffered = 0
+                self.last_commit_ts = now
 
     async def _commit_and_request_response(self):
         if not self.oai_ws:
@@ -188,22 +207,34 @@ class Bridge:
                     self.seen_start = True
                     self.stream_sid = data.get("start", {}).get("streamSid")
                     print("Twilio start, streamSid:", self.stream_sid)
+                    self.last_commit_ts = time.time()
                 elif event == "media":
                     ulaw_b64 = data["media"]["payload"]
                     ulaw = base64.b64decode(ulaw_b64)
                     pcm16_8k = ulaw_decode_bytes(ulaw)
+
+                    # Barge-in: Falls wir gerade abspielen, Playback abbrechen
                     if self.playing_audio and self.stream_sid:
                         print("Barge-in: clearing playback")
                         await self._twilio_send({"event": "clear", "streamSid": self.stream_sid})
                         self.playing_audio = False
+
+                    # an OpenAI anhängen
+                    b = base64.b64encode(pcm16_8k).decode()
                     await self.oai_ws.send(json.dumps({
                         "type": "input_audio_buffer.append",
-                        "audio": base64.b64encode(pcm16_8k).decode(),
+                        "audio": b,
                     }))
+
+                    # Buffer-Tracking
+                    self.bytes_buffered += len(pcm16_8k)
                     self.last_media_ts = time.time()
                 elif event == "stop":
                     print("Twilio stop")
-                    await self._commit_and_request_response()
+                    if self.bytes_buffered > 0:
+                        await self._commit_and_request_response()
+                        self.bytes_buffered = 0
+                        self.last_commit_ts = time.time()
                     break
         except WebSocketDisconnect:
             print("Twilio WS disconnect")
