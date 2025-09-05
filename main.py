@@ -95,7 +95,7 @@ async def telefon_live():
     print("TwiML requested. Using stream URL:", wss_url)
     xml = f"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
 <Response>
-  <Say language=\"de-DE\" voice=\"Polly.Vicki-Neural\">Willkommen bei wowona Live. Einen Moment bitte…</Say>
+  <Say language=\"de-DE\" voice=\"Polly.Vicki-Neural\">Willkommen bei wowona Live. Stelkle deine Frage</Say>
   <Connect>
     <Stream url=\"{wss_url}\" />
   </Connect>
