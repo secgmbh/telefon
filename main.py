@@ -163,8 +163,7 @@ async def telefon_live(request: Request):
     action_url = f"{base}/telefon_live/process"
 
     greeting = (
-        "Hallo! Du sprichst mit einer KI-Assistentin. "
-        "Was möchtest du wissen?"
+        "Willkommen bei wowona. Mein Name ist Petra, wie kann ich dir helfen?"
     )
     xml = _gather_twiml(greeting, action_url)
     return _twiml_response(xml)
