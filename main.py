@@ -7,7 +7,7 @@ import logging
 from typing import Optional, List, Tuple
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import HTMLResponse, Response, JSONResponse
+from fastapi.responses import HTMLResponse, Response
 
 import websockets
 
@@ -20,10 +20,8 @@ log = logging.getLogger("telefon-app")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview-2024-12-17")
 OPENAI_VOICE = os.getenv("OPENAI_VOICE", "verse")  # realistischere Stimme
-# Twilio → OpenAI: sehr kurze Sprechpausen für schnelle Antworten
-INACTIVITY_COMMIT_MS = int(os.getenv("INACTIVITY_COMMIT_MS", "550"))  # optional anpassen (z. B. 500–800)
+INACTIVITY_COMMIT_MS = int(os.getenv("INACTIVITY_COMMIT_MS", "550"))  # schnelle Reaktion
 
-# Hinweis: Twilio sendet G.711 µ-law (PCMU, 8 kHz). Wir sagen OpenAI explizit, was reinkommt und raus soll.
 INPUT_AUDIO_FORMAT = os.getenv("INPUT_AUDIO_FORMAT", "g711_ulaw")
 OUTPUT_AUDIO_FORMAT = os.getenv("OUTPUT_AUDIO_FORMAT", "g711_ulaw")
 
@@ -39,7 +37,7 @@ async def root():
       <body style="font-family: system-ui; line-height:1.5">
         <h3>Telefon-KI Bridge läuft ✅</h3>
         <ul>
-          <li>Voice Webhook: <code>/telefon_live</code></li>
+          <li>Voice Webhook (TwiML): <code>POST /telefon_live</code></li>
           <li>Media Stream WS: <code>/twilio-media-stream</code></li>
         </ul>
       </body>
@@ -58,17 +56,13 @@ async def telefon_live(request: Request):
     except Exception:
         log.info("telefon-app: Twilio Voice webhook payload: (kein Form-Parsen möglich)")
 
-    # WS-Basis ermitteln
-    override_ws = os.getenv("WS_BASE_URL")  # z. B. wss://dein-service.onrender.com/twilio-media-stream
+    override_ws = os.getenv("WS_BASE_URL")  # optional: z. B. wss://dein-service.onrender.com/twilio-media-stream
     if override_ws:
         ws_url = override_ws
     else:
-        # automatisch aus Request ableiten
-        # Twilio braucht wss://
         host = request.url.hostname
         ws_url = f"wss://{host}/twilio-media-stream"
 
-    # TwiML mit <Connect><Stream>
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
@@ -79,7 +73,7 @@ async def telefon_live(request: Request):
 
 
 # -----------------------------------------------------------------------------
-# Helfer: OpenAI-Realtime WebSocket verbinden
+# OpenAI-Realtime WebSocket verbinden
 # -----------------------------------------------------------------------------
 async def connect_openai_ws() -> websockets.WebSocketClientProtocol:
     if not OPENAI_API_KEY:
@@ -87,8 +81,6 @@ async def connect_openai_ws() -> websockets.WebSocketClientProtocol:
 
     url = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}"
 
-    # Bei neueren websockets-Versionen heißt der Header-Parameter "additional_headers"
-    # (statt "extra_headers"). Das vermeidet den früheren Fehler.
     headers: List[Tuple[str, str]] = [
         ("Authorization", f"Bearer {OPENAI_API_KEY}"),
         ("OpenAI-Beta", "realtime=v1"),
@@ -96,11 +88,51 @@ async def connect_openai_ws() -> websockets.WebSocketClientProtocol:
 
     ws = await websockets.connect(
         url,
-        additional_headers=headers,  # <— wichtig
+        additional_headers=headers,  # wichtig für die installierte websockets-Version
         max_size=None,
         compression=None,
     )
     return ws
+
+
+# -----------------------------------------------------------------------------
+# Hilfsfunktion: OpenAI-Base64-Audio → 20ms Twilio-Frames senden
+# -----------------------------------------------------------------------------
+async def send_audio_to_twilio(twilio_ws: WebSocket, stream_sid: str, audio_b64: str):
+    """
+    Twilio erwartet 20ms G.711 µ-law Frames => 160 Bytes pro Frame bei 8kHz.
+    Wir splitten Bytes in 160-Byte-Chunks und senden jeden einzeln.
+    """
+    try:
+        raw = base64.b64decode(audio_b64)
+    except Exception:
+        # Falls OpenAI bereits passende Chunks liefert, direkt weiterreichen
+        raw = None
+
+    if raw is None:
+        await twilio_ws.send_text(json.dumps({
+            "event": "media",
+            "streamSid": stream_sid,
+            "media": {
+                "payload": audio_b64,
+                "track": "outbound"
+            }
+        }))
+        return
+
+    frame_size = 160  # 20ms @ 8kHz µ-law
+    for i in range(0, len(raw), frame_size):
+        chunk = raw[i:i + frame_size]
+        if not chunk:
+            continue
+        await twilio_ws.send_text(json.dumps({
+            "event": "media",
+            "streamSid": stream_sid,
+            "media": {
+                "payload": base64.b64encode(chunk).decode("ascii"),
+                "track": "outbound"
+            }
+        }))
 
 
 # -----------------------------------------------------------------------------
@@ -120,18 +152,22 @@ async def twilio_media_stream(ws: WebSocket):
     buffer_open = False
     silence_task = None
 
-    # Empfangs-/Sende-Tasks
+    # OpenAI → Twilio
     async def _openai_to_twilio():
-        """Pumpt Audio-Delta von OpenAI zu Twilio (Caller)."""
         nonlocal twilio_stream_sid
         try:
+            first_audio_timeout = loop.time() + 5.0  # 5s Beobachtung für Debug
             while True:
                 raw = await openai_ws.recv()
                 if isinstance(raw, bytes):
-                    # Normalerweise bekommen wir JSON-Text; bytes ignorieren.
                     continue
                 obj = json.loads(raw)
                 t = (obj.get("type") or obj.get("event") or "").lower()
+
+                # Debug: wenn 5s lang gar keine Audio-Events kamen
+                if loop.time() > first_audio_timeout:
+                    first_audio_timeout = 1e9
+                    log.info("telefon-app: Hinweis: Noch keine Audio-Delta-Events von OpenAI angekommen.")
 
                 # Mögliche Audio-Delta-Varianten robust behandeln
                 audio_b64 = None
@@ -148,12 +184,7 @@ async def twilio_media_stream(ws: WebSocket):
                         audio_b64 = obj["delta"]["audio"]
 
                 if audio_b64 and twilio_stream_sid:
-                    # Audio an Twilio zurückspielen
-                    await ws.send_text(json.dumps({
-                        "event": "media",
-                        "streamSid": twilio_stream_sid,
-                        "media": {"payload": audio_b64}
-                    }))
+                    await send_audio_to_twilio(ws, twilio_stream_sid, audio_b64)
 
                 # (Optional) Logging bei abgeschlossenen Antworten
                 if t in ("response.completed", "response.done"):
@@ -164,8 +195,8 @@ async def twilio_media_stream(ws: WebSocket):
         except Exception as e:
             log.exception("Fehler in openai_to_twilio: %s", e)
 
+    # Twilio → OpenAI
     async def _twilio_to_openai():
-        """Pumpt eingehendes Caller-Audio zu OpenAI (input_audio_buffer)."""
         nonlocal twilio_stream_sid, last_audio_ts, buffer_open
         try:
             while True:
@@ -176,7 +207,7 @@ async def twilio_media_stream(ws: WebSocket):
                 if event == "start":
                     start = data.get("start") or {}
                     twilio_stream_sid = start.get("streamSid")
-                    log.info("telefon-app: WS connected: %s", {"event": event, **{k: start.get(k) for k in ("protocol", "version") if start.get(k)}})
+                    log.info("telefon-app: WS connected: %s", {"event": event})
                     log.info("telefon-app: Stream gestartet: streamSid=%s callSid=%s", twilio_stream_sid, start.get("callSid"))
 
                 elif event == "media":
@@ -187,13 +218,8 @@ async def twilio_media_stream(ws: WebSocket):
                             "type": "input_audio_buffer.append",
                             "audio": payload  # Twilio base64 PCMU
                         }))
-                        # Fallback-VAD: Wir haben gerade Audio erhalten
                         buffer_open = True
                         last_audio_ts = loop.time()
-
-                elif event == "mark":
-                    # Ignorieren oder für Debug nutzen
-                    pass
 
                 elif event == "stop":
                     log.info("telefon-app: Stream gestoppt: %s", data.get("stop") or {})
@@ -204,8 +230,8 @@ async def twilio_media_stream(ws: WebSocket):
         except Exception as e:
             log.exception("Fehler in twilio_to_openai: %s", e)
 
+    # Fallback: kurze Stille => commit + Antwort
     async def _commit_on_silence():
-        """Sehr kurze Stille ⇒ wir committen & fordern Antwort an (Fallback)."""
         nonlocal last_audio_ts, buffer_open
         try:
             while True:
@@ -213,11 +239,16 @@ async def twilio_media_stream(ws: WebSocket):
                 if buffer_open and last_audio_ts > 0:
                     ms_since = (loop.time() - last_audio_ts) * 1000.0
                     if ms_since >= INACTIVITY_COMMIT_MS:
-                        # Abschluss des Eingabe-Buffers + Antwort anfordern
                         await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
                         await openai_ws.send(json.dumps({
                             "type": "response.create",
-                            "response": {"modalities": ["audio"]}
+                            "response": {
+                                "modalities": ["audio"],
+                                "audio": {
+                                    "voice": OPENAI_VOICE,
+                                    "format": OUTPUT_AUDIO_FORMAT
+                                }
+                            }
                         }))
                         buffer_open = False
         except asyncio.CancelledError:
@@ -235,15 +266,12 @@ async def twilio_media_stream(ws: WebSocket):
             await ws.close()
             return
 
-        # Session konfigurieren: Stimme, Formate, schnelle VAD
+        # Session konfigurieren: Eingabeformat & VAD (Ausgabeformat setzen wir direkt pro Response)
         session_update = {
             "type": "session.update",
             "session": {
-                "voice": OPENAI_VOICE,
                 "modalities": ["audio"],
                 "input_audio_format": INPUT_AUDIO_FORMAT,
-                "output_audio_format": OUTPUT_AUDIO_FORMAT,
-                # Serverseitige Turn-Detection mit kurzer Stille (zusätzlich zu unserem Fallback)
                 "turn_detection": {
                     "type": "server_vad",
                     "silence_duration_ms": INACTIVITY_COMMIT_MS
@@ -252,11 +280,15 @@ async def twilio_media_stream(ws: WebSocket):
         }
         await openai_ws.send(json.dumps(session_update))
 
-        # >>> NEU: Sofortige Begrüßung abspielen
+        # >>> Begrüßung (explizites Audio-Format + Stimme am Response!)
         await openai_ws.send(json.dumps({
             "type": "response.create",
             "response": {
                 "modalities": ["audio"],
+                "audio": {
+                    "voice": OPENAI_VOICE,
+                    "format": OUTPUT_AUDIO_FORMAT
+                },
                 "instructions": "Hallo! Ich bin Ihre KI am Telefon. Wie kann ich helfen?"
             }
         }))
@@ -266,7 +298,6 @@ async def twilio_media_stream(ws: WebSocket):
         to_openai = asyncio.create_task(_twilio_to_openai())
         to_twilio = asyncio.create_task(_openai_to_twilio())
 
-        # Warten, bis eine Seite fertig ist
         done, pending = await asyncio.wait(
             {to_openai, to_twilio},
             return_when=asyncio.FIRST_COMPLETED
@@ -277,20 +308,16 @@ async def twilio_media_stream(ws: WebSocket):
     except Exception as e:
         log.exception("Unerwarteter Fehler in twilio_media_stream: %s", e)
     finally:
-        # Tasks sauber beenden
         try:
             if silence_task:
                 silence_task.cancel()
         except Exception:
             pass
-
-        # Verbindungen schließen
         try:
             if openai_ws:
                 await openai_ws.close()
         except Exception:
             pass
-
         try:
             await ws.close()
         except Exception:
