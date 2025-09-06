@@ -1,6 +1,6 @@
 # main.py
-# FastAPI-App für Telefon-KI per Twilio <Gather> (Speech) + OpenAI Chat + Twilio <Say> (TTS, Polly Neural)
-# Fokus: niedrigere Latenz (barge-in, kurze Antworten) & natürlichere Stimme
+# FastAPI-App für Telefon-KI per Twilio <Gather> (Speech) + OpenAI Chat + Twilio <Say> (TTS)
+# Ohne externe HTTP-Client-Libs (nur urllib aus der Stdlib) -> kein "requests" nötig.
 
 import os
 import json
@@ -18,17 +18,8 @@ from fastapi.responses import HTMLResponse, PlainTextResponse
 
 APP_NAME = "telefon-app"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()  # schneller, okay für Telefon
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()  # bei Bedarf ändern
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
-
-# Natürlichere Stimme: Twilio unterstützt Polly Neural direkt.
-# Gute deutsche Stimmen: Polly.Marlene-Neural, Polly.Vicki-Neural
-TTS_VOICE = os.getenv("TTS_VOICE", "Polly.Marlene-Neural").strip()
-TTS_LANG = os.getenv("TTS_LANG", "de-DE").strip()
-
-# Modell-Feintuning für Tempo
-OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.4"))
-OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "220"))
 
 # Logging
 logging.basicConfig(
@@ -54,7 +45,7 @@ def _escape_xml(text: str) -> str:
         .replace(">", "&gt;")
     )
 
-def _openai_chat(messages: List[Dict[str, str]], temperature: float = OPENAI_TEMPERATURE, max_tokens: int = OPENAI_MAX_TOKENS) -> str:
+def _openai_chat(messages: List[Dict[str, str]], temperature: float = 0.6, max_tokens: int = 350) -> str:
     """
     Ruft OpenAI Chat Completions mit urllib auf (kein 'requests' nötig).
     Gibt Assistant-Text zurück oder eine Fehlermeldung.
@@ -78,16 +69,14 @@ def _openai_chat(messages: List[Dict[str, str]], temperature: float = OPENAI_TEM
         headers={
             "Authorization": f"Bearer {OPENAI_API_KEY}",
             "Content-Type": "application/json",
-            # Keep-Alive kann bei manchen Hosts minimal helfen
-            "Connection": "keep-alive",
         },
     )
 
     try:
-        # kürzeres Timeout, um Hänger zu vermeiden
-        with urlrequest.urlopen(req, timeout=15) as resp:
+        with urlrequest.urlopen(req, timeout=20) as resp:
             body = resp.read().decode("utf-8")
             j = json.loads(body)
+            # Erwartetes Format: choices[0].message.content
             content = (
                 j.get("choices", [{}])[0]
                 .get("message", {})
@@ -96,7 +85,7 @@ def _openai_chat(messages: List[Dict[str, str]], temperature: float = OPENAI_TEM
             )
             if not content:
                 log.warning("OpenAI-Antwort leer oder unerwartet: %s", body)
-                return "Dazu habe ich gerade keine passende Antwort. Formuliere es bitte kurz neu."
+                return "Ich habe darauf keine passende Antwort erhalten. Formuliere es bitte anders."
             return content
     except HTTPError as e:
         try:
@@ -104,10 +93,10 @@ def _openai_chat(messages: List[Dict[str, str]], temperature: float = OPENAI_TEM
         except Exception:
             err_body = str(e)
         log.error("OpenAI HTTPError %s: %s", e.code, err_body)
-        return "Im Moment gibt es ein Problem bei der Verarbeitung. Bitte versuche es gleich nochmal."
+        return "Gerade gibt es ein Problem bei der Verarbeitung. Bitte versuche es gleich nochmal."
     except URLError as e:
         log.error("OpenAI URLError: %s", e)
-        return "Ich habe gerade keine Verbindung zum Sprachmodell. Bitte später erneut versuchen."
+        return "Ich habe keine Verbindung zum Sprachmodell. Bitte später erneut versuchen."
     except Exception as e:
         log.exception("Unerwarteter Fehler bei OpenAI-Call: %s", e)
         return "Da ist etwas Unerwartetes passiert. Bitte frag mich nochmal."
@@ -119,42 +108,29 @@ def _base_url_from_request(req: Request) -> str:
 def _gather_twiml(prompt_text: str, action_url: str) -> str:
     """
     Baut ein TwiML mit <Gather input="speech"> und einem Prompt (<Say>).
-    - bargeIn="true": Anrufer kann schon während der Ansage sprechen.
-    - speechModel="phone_call": passende Erkennung für Telefon.
     """
     prompt_text = _escape_xml(prompt_text)
+    # voice="alice" + language="de-DE" funktionieren ohne Polly-Voices.
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Gather input="speech"
-          language="{TTS_LANG}"
-          action="{action_url}"
-          method="POST"
-          speechTimeout="auto"
-          bargeIn="true"
-          speechModel="phone_call">
-    <Say voice="{TTS_VOICE}" language="{TTS_LANG}">{prompt_text}</Say>
+  <Gather input="speech" language="de-DE" action="{action_url}" method="POST" speechTimeout="auto">
+    <Say voice="alice" language="de-DE">{prompt_text}</Say>
   </Gather>
-  <Say voice="{TTS_VOICE}" language="{TTS_LANG}">Ich habe nichts gehört. Auf Wiederhören!</Say>
+  <Say voice="alice" language="de-DE">Ich habe nichts gehört. Auf Wiederhören!</Say>
 </Response>"""
 
 def _answer_and_reprompt_twiml(answer_text: str, action_url: str) -> str:
     """
-    Antwort sprechen und erneut nach einer weiteren Frage fragen (erneutes Gather, wieder mit barge-in).
+    Antwort sprechen und erneut nach einer weiteren Frage fragen (erneutes Gather).
     """
     answer_text = _escape_xml(answer_text)
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="{TTS_VOICE}" language="{TTS_LANG}">{answer_text}</Say>
-  <Gather input="speech"
-          language="{TTS_LANG}"
-          action="{action_url}"
-          method="POST"
-          speechTimeout="auto"
-          bargeIn="true"
-          speechModel="phone_call">
-    <Say voice="{TTS_VOICE}" language="{TTS_LANG}">Noch eine Frage?</Say>
+  <Say voice="alice" language="de-DE">{answer_text}</Say>
+  <Gather input="speech" language="de-DE" action="{action_url}" method="POST" speechTimeout="auto">
+    <Say voice="alice" language="de-DE">Möchtest du noch etwas fragen?</Say>
   </Gather>
-  <Say voice="{TTS_VOICE}" language="{TTS_LANG}">Alles klar. Tschüss!</Say>
+  <Say voice="alice" language="de-DE">Alles klar. Tschüss!</Say>
 </Response>"""
 
 # ------------------------------------------------------------------------------
@@ -186,7 +162,10 @@ async def telefon_live(request: Request):
     base = _base_url_from_request(request)
     action_url = f"{base}/telefon_live/process"
 
-    greeting = "Hallo! Was möchtest du wissen?"
+    greeting = (
+        "Hallo! Du sprichst mit einer KI-Assistentin. "
+        "Was möchtest du wissen?"
+    )
     xml = _gather_twiml(greeting, action_url)
     return _twiml_response(xml)
 
@@ -206,14 +185,15 @@ async def telefon_process(request: Request):
     action_url = f"{base}/telefon_live/process"
 
     if not user_text:
+        # Nichts gehört → erneut Gather anbieten
         xml = _gather_twiml("Ich habe dich nicht verstanden. Was möchtest du wissen?", action_url)
         return _twiml_response(xml)
 
-    # Kurzer, telefonoptimierter Stil
+    # OpenAI aufrufen
     system_prompt = (
         "Du bist eine freundliche, prägnante Telefon-KI auf Deutsch. "
-        "Antworte in maximal zwei kurzen Sätzen, klar und ohne Fachjargon. "
-        "Wenn sinnvoll, nenne eine konkrete nächste Option oder Frage."
+        "Antworte kurz, klar und gut verständlich für Telefon-Audio. "
+        "Vermeide lange Listen und Fachjargon."
     )
     messages = [
         {"role": "system", "content": system_prompt},
