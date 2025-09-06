@@ -8,7 +8,7 @@ from typing import Optional
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, HTMLResponse, PlainTextResponse
 from dotenv import load_dotenv
-
+import aiohttp
 import websockets
 
 load_dotenv()
@@ -17,20 +17,17 @@ load_dotenv()
 # Konfiguration / Env
 # =========================
 OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY") or "").strip()
-# Bevorzugt OPENAI_REALTIME_MODEL, fallback auf OPENAI_MODEL:
 OPENAI_REALTIME_MODEL = (os.getenv("OPENAI_REALTIME_MODEL") or os.getenv("OPENAI_MODEL") or "gpt-realtime").strip()
 
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY fehlt (Env oder .env).")
 
-# Stimme (nur erlaubte Namen)
 ALLOWED_OAI_VOICES = {"alloy","ash","ballad","coral","echo","sage","shimmer","verse","marin","cedar"}
 TWILIO_VOICE = (os.getenv("TWILIO_VOICE") or "verse").strip().lower()
 if TWILIO_VOICE not in ALLOWED_OAI_VOICES:
     print(f"[config] Unsupported voice '{TWILIO_VOICE}'. Falling back to 'verse'. Supported: {sorted(ALLOWED_OAI_VOICES)}")
     TWILIO_VOICE = "verse"
 
-# Begrüßung & System-Prompt (Deutsch)
 AUTO_GREETING = os.getenv("AUTO_GREETING", "Guten Tag! Ich bin Ihr Assistent. Wie kann ich helfen?")
 SYSTEM_PROMPT = os.getenv(
     "REALTIME_SYSTEM_PROMPT",
@@ -38,15 +35,14 @@ SYSTEM_PROMPT = os.getenv(
     "Antworte in 2–4 Sätzen und frage nach, wenn etwas unklar ist."
 )
 
-# VAD-Feintuning
 def _to_int(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, str(default)))
     except Exception:
         return default
 
-VAD_SILENCE_MS = _to_int("VAD_SILENCE_MS", 900)     # Pause-Erkennung
-POST_GREETING_MUTE_MS = _to_int("POST_GREETING_MUTE_MS", 1200)  # Echo-Schutz nach Begrüßung
+VAD_SILENCE_MS = _to_int("VAD_SILENCE_MS", 900)
+POST_GREETING_MUTE_MS = _to_int("POST_GREETING_MUTE_MS", 1200)
 
 # =========================
 # FastAPI
@@ -63,38 +59,43 @@ async def healthz():
 
 @app.get("/diag")
 async def diag():
-    # kleiner Echtzeit-Smoke-Test (nur Session-Create, keine Audio)
+    # Realtime Smoke-Test via aiohttp (vermeidet websockets.extra_headers Konflikte)
     url = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}"
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "OpenAI-Beta": "openai-beta.realtime-v1",
+    }
     try:
-        async with websockets.connect(
-            url,
-            extra_headers=[
-                ("Authorization", f"Bearer {OPENAI_API_KEY}"),
-                ("OpenAI-Beta", "openai-beta.realtime-v1"),
-            ],
-            subprotocols=["realtime","openai-beta.realtime-v1"],
-            ping_interval=20,
-            ping_timeout=20,
-        ) as oai:
-            await oai.send(json.dumps({"type":"session.update","session":{
-                "modalities":["audio","text"],
-                "voice": TWILIO_VOICE,
-                "input_audio_format":"g711_ulaw",
-                "output_audio_format":"g711_ulaw",
-                "turn_detection":{"type":"server_vad","silence_duration_ms": VAD_SILENCE_MS},
-                "instructions": SYSTEM_PROMPT,
-            }}))
-            return PlainTextResponse('diag: ok - session.updated')
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(
+                url,
+                headers=headers,
+                protocols=["realtime","openai-beta.realtime-v1"],
+                heartbeat=20,
+                autoping=True,
+                timeout=20,
+                max_msg_size=10*1024*1024
+            ) as oai:
+                await oai.send_json({
+                    "type": "session.update",
+                    "session": {
+                        "modalities": ["audio","text"],
+                        "voice": TWILIO_VOICE,
+                        "input_audio_format": "g711_ulaw",
+                        "output_audio_format": "g711_ulaw",
+                        "turn_detection": {"type":"server_vad","silence_duration_ms": VAD_SILENCE_MS},
+                        "instructions": SYSTEM_PROMPT,
+                    },
+                })
+                return PlainTextResponse('diag: ok - session.updated')
     except Exception as e:
         return PlainTextResponse(f'diag: error - {repr(e)}', status_code=500)
 
 def _http_to_ws(url: str) -> str:
-    # robustes Umschalten des Schemas
     return url.replace("https://", "wss://").replace("http://", "ws://")
 
 @app.api_route("/telefon_live", methods=["GET","POST"])
 async def telefon_live(request: Request):
-    # TwiML mit bidirektionalem Track + Status-Callback
     ws_url = _http_to_ws(str(request.url_for("twilio_stream")))
     status_url = str(request.url_for("stream_status"))
     print(f"TwiML requested. Using stream URL: {ws_url} | statusCallback: {status_url}")
@@ -122,7 +123,6 @@ async def stream_status(request: Request):
 
 @app.websocket("/twilio-stream")
 async def twilio_stream(ws: WebSocket):
-    # Subprotokoll dynamisch übernehmen (falls angeboten), sonst „plain“
     req_proto = ws.headers.get("sec-websocket-protocol", "")
     requested = [p.strip() for p in req_proto.split(",") if p.strip()]
     subproto = None
@@ -190,7 +190,6 @@ class TwilioOpenAIBridge:
                 return await self._connect_openai(attempt + 1)
             raise
 
-        # Session-Update: Deutsch + μ-law + VAD + Stimme
         await self._oai_send_json({
             "type": "session.update",
             "session": {
@@ -203,7 +202,6 @@ class TwilioOpenAIBridge:
             },
         }, "session.update")
 
-        # Begrüßung
         await self._oai_send_json({
             "type":"response.create",
             "response": {"modalities":["audio","text"], "instructions": AUTO_GREETING}
@@ -238,12 +236,6 @@ class TwilioOpenAIBridge:
             self.oai_ws = None
 
     async def _pipe_twilio_to_openai(self):
-        """
-        Twilio → OpenAI:
-        - event 'media': μ-law Base64 → input_audio_buffer.append
-        - event 'start': streamSid merken
-        - event 'stop': Ende des Streams
-        """
         async for message in self.twilio_ws.iter_text():
             try:
                 data = json.loads(message)
@@ -257,7 +249,6 @@ class TwilioOpenAIBridge:
             elif etype == "start":
                 self.twilio_stream_sid = data.get("start", {}).get("streamSid")
                 print("Twilio start, streamSid:", self.twilio_stream_sid)
-                # kurzes Mute-Fenster nach der Begrüßung
                 await asyncio.sleep(self._post_greeting_mute)
             elif etype == "media":
                 payload = data.get("media", {}).get("payload")
@@ -266,21 +257,13 @@ class TwilioOpenAIBridge:
                         {"type": "input_audio_buffer.append", "audio": payload},
                         "input_audio_buffer.append"
                     )
-            elif etype == "mark":
-                pass  # optional loggen
             elif etype == "stop":
                 print("Twilio stop (call ended)")
                 break
-            else:
-                pass
 
         print("Twilio reader: stream ended")
 
     async def _pipe_openai_to_twilio(self):
-        """
-        OpenAI → Twilio:
-        - response.output_audio.delta: μ-law Base64 per 'media' inkl. streamSid zurück
-        """
         if not self.oai_ws:
             print("OAI reader: socket missing, abort")
             return
@@ -305,11 +288,7 @@ class TwilioOpenAIBridge:
                             "media": {"payload": audio}
                         }))
                 elif mtype == "response.completed":
-                    # kleine Pause fürs Gegenüber
                     await asyncio.sleep(0.6)
-                else:
-                    # weitere Events nach Bedarf
-                    pass
         except websockets.exceptions.ConnectionClosedError as e:
             print("OAI pipe error:", repr(e))
         except Exception as e:
