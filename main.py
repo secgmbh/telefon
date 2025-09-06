@@ -128,7 +128,7 @@ def _answer_and_reprompt_twiml(answer_text: str, action_url: str) -> str:
 <Response>
   <Say voice="Polly.Vicki-Neural" language="de-DE">{answer_text}</Say>
   <Gather input="speech" language="de-DE" action="{action_url}" method="POST" speechTimeout="auto">
-    <Say voice="Polly.Vicki-Neural" language="de-DE">Möchtest du noch etwas fragen?</Say>
+    <Say voice="Polly.Vicki-Neural" language="de-DE"></Say>
   </Gather>
   <Say voice="Polly.Vicki-Neural" language="de-DE">Alles klar. Tschüss!</Say>
 </Response>"""
