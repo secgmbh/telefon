@@ -1,4 +1,4 @@
-# main.py (Twilio ↔ OpenAI Realtime, Deutsch)
+# main.py (Twilio ↔ OpenAI Realtime, Deutsch) – AIOHTTP WS client
 import os
 import json
 import asyncio
@@ -10,7 +10,6 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, HTMLResponse, PlainTextResponse
 from dotenv import load_dotenv
 import aiohttp
-import websockets
 
 load_dotenv()
 
@@ -60,7 +59,7 @@ async def healthz():
 
 @app.get("/diag")
 async def diag():
-    # Realtime Smoke-Test via aiohttp (vermeidet websockets.extra_headers Konflikte)
+    # Realtime Smoke-Test via aiohttp (stabil; keine extra_headers-Probleme)
     url = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}"
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
@@ -77,7 +76,7 @@ async def diag():
                 timeout=20,
                 max_msg_size=10*1024*1024
             ) as oai:
-                await oai.send_json({
+                await oai.send_str(json.dumps({
                     "type": "session.update",
                     "session": {
                         "modalities": ["audio","text"],
@@ -87,7 +86,7 @@ async def diag():
                         "turn_detection": {"type":"server_vad","silence_duration_ms": VAD_SILENCE_MS},
                         "instructions": SYSTEM_PROMPT,
                     },
-                })
+                }))
                 return PlainTextResponse('diag: ok - session.updated')
     except Exception as e:
         return PlainTextResponse(f'diag: error - {repr(e)}', status_code=500)
@@ -163,7 +162,8 @@ async def twilio_stream(ws: WebSocket):
 class TwilioOpenAIBridge:
     def __init__(self, twilio_ws: WebSocket):
         self.twilio_ws = twilio_ws
-        self.oai_ws: Optional[websockets.WebSocketClientProtocol] = None
+        self.oai_ws: Optional[aiohttp.ClientWebSocketResponse] = None
+        self._http: Optional[aiohttp.ClientSession] = None
         self.running = True
         self._oai_reader_task: Optional[asyncio.Task] = None
         self._twilio_reader_task: Optional[asyncio.Task] = None
@@ -172,21 +172,23 @@ class TwilioOpenAIBridge:
 
     async def _connect_openai(self, attempt: int = 1):
         url = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}"
-        headers = [
-            ("Authorization", f"Bearer {OPENAI_API_KEY}"),
-            ("OpenAI-Beta", "openai-beta.realtime-v1"),
-        ]
+        headers = {
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "OpenAI-Beta": "openai-beta.realtime-v1",
+        }
         print(f"OAI: connecting → {url}")
         try:
-            self.oai_ws = await websockets.connect(
+            self._http = aiohttp.ClientSession()
+            self.oai_ws = await self._http.ws_connect(
                 url,
-                extra_headers=headers,
-                subprotocols=["realtime","openai-beta.realtime-v1"],
-                ping_interval=20,
-                ping_timeout=20,
-                max_size=10 * 1024 * 1024,
+                headers=headers,
+                protocols=["realtime","openai-beta.realtime-v1"],
+                heartbeat=20,
+                autoping=True,
+                timeout=20,
+                max_msg_size=10*1024*1024,
             )
-            print(f"OAI: connected (negotiated={self.oai_ws.subprotocol})")
+            print(f"OAI: connected (aiohttp, protocols set)")
         except Exception as e:
             print(f"OAI: connect failed (attempt {attempt}):", repr(e))
             if attempt < 3 and self.running:
@@ -234,12 +236,18 @@ class TwilioOpenAIBridge:
 
     async def stop(self):
         self.running = False
-        if self.oai_ws:
-            try:
+        try:
+            if self.oai_ws is not None:
                 await self.oai_ws.close()
-            except Exception:
-                pass
-            self.oai_ws = None
+        except Exception:
+            pass
+        try:
+            if self._http is not None:
+                await self._http.close()
+        except Exception:
+            pass
+        self.oai_ws = None
+        self._http = None
 
     async def _pipe_twilio_to_openai(self):
         """
@@ -289,10 +297,17 @@ class TwilioOpenAIBridge:
 
         try:
             async for msg in self.oai_ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    raw = msg.data
+                elif msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.CLOSED):
+                    break
+                else:
+                    continue
+
                 try:
-                    data = json.loads(msg)
+                    data = json.loads(raw)
                 except Exception:
-                    print("OAI RX (non-JSON):", msg[:180], "…")
+                    print("OAI RX (non-JSON):", str(raw)[:180], "…")
                     continue
 
                 mtype = data.get("type")
@@ -311,10 +326,8 @@ class TwilioOpenAIBridge:
                     await asyncio.sleep(0.6)
                 else:
                     pass
-        except websockets.exceptions.ConnectionClosedError as e:
-            print("OAI pipe error:", repr(e))
         except Exception as e:
-            print("OAI pipe generic error:", repr(e))
+            print("OAI pipe error:", repr(e))
             traceback.print_exc()
         finally:
             print("OpenAI reader: stream ended")
@@ -324,7 +337,7 @@ class TwilioOpenAIBridge:
             print(f"[WARN] OAI send skipped ({label}) – socket not open")
             return
         try:
-            await self.oai_ws.send(json.dumps(payload))
+            await self.oai_ws.send_str(json.dumps(payload))
             if label:
                 preview = json.dumps(payload)
                 if len(preview) > 300:
