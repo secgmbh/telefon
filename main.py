@@ -45,7 +45,7 @@ def _escape_xml(text: str) -> str:
         .replace(">", "&gt;")
     )
 
-def _openai_chat(messages: List[Dict[str, str]], temperature: float = 0.6, max_tokens: int = 350) -> str:
+def _openai_chat(messages: List[Dict[str, str]], temperature: float = 0.3, max_tokens: int = 160) -> str:
     """
     Ruft OpenAI Chat Completions mit urllib auf (kein 'requests' nötig).
     Gibt Assistant-Text zurück oder eine Fehlermeldung.
@@ -116,16 +116,16 @@ def _gather_twiml(prompt_text: str, action_url: str) -> str:
           speechTimeout="auto"
           bargeIn="true"
           speechModel="phone_call">
-    <Say voice="Vicki-Neural" language="de-DE">{prompt_text}</Say>
+    <Say voice="Polly.Vicki-Generative" language="de-DE">{prompt_text}</Say>
   </Gather>
-  <Say voice="Vicki-Neural" language="de-DE">Ich habe nichts gehört. Auf Wiederhören!</Say>
+  <Say voice="Polly.Vicki-Generative" language="de-DE">Ich habe nichts gehört. Auf Wiederhören!</Say>
 </Response>"""
 
 def _answer_and_reprompt_twiml(answer_text: str, action_url: str) -> str:
     answer_text = _escape_xml(answer_text)
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Vicki-Neural" language="de-DE">{answer_text}</Say>
+  <Say voice="Polly.Vicki-Generative" language="de-DE">{answer_text}</Say>
   <Gather input="speech"
           language="de-DE"
           action="{action_url}"
@@ -133,9 +133,9 @@ def _answer_and_reprompt_twiml(answer_text: str, action_url: str) -> str:
           speechTimeout="auto"
           bargeIn="true"
           speechModel="phone_call">
-    <Say voice="Vicki-Neural" language="de-DE"></Say>
+    <Say voice="Polly.Vicki-Generative" language="de-DE"></Say>
   </Gather>
-  <Say voice="Vicki-Neural" language="de-DE">Leider habe ich keine weitere Fragen verstanden. Ich lege daher auf und wünsche einen schönen Tag.</Say>
+  <Say voice="Polly.Vicki-Generative" language="de-DE">Leider habe ich keine weitere Fragen verstanden. Ich lege daher auf und wünsche einen schönen Tag.</Say>
 </Response>"""
 
 # ------------------------------------------------------------------------------
