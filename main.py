@@ -106,31 +106,36 @@ def _base_url_from_request(req: Request) -> str:
     return str(req.base_url).rstrip("/")
 
 def _gather_twiml(prompt_text: str, action_url: str) -> str:
-    """
-    Baut ein TwiML mit <Gather input="speech"> und einem Prompt (<Say>).
-    """
     prompt_text = _escape_xml(prompt_text)
-    # voice="Polly.Vicki-Neural" + language="de-DE" funktionieren ohne Polly-Voices.
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Gather input="speech" language="de-DE" action="{action_url}" method="POST" speechTimeout="auto">
-    <Say voice="Polly.Vicki-Neural" language="de-DE">{prompt_text}</Say>
+  <Gather input="speech"
+          language="de-DE"
+          action="{action_url}"
+          method="POST"
+          speechTimeout="auto"
+          bargeIn="true"
+          speechModel="phone_call">
+    <Say voice="alice" language="de-DE">{prompt_text}</Say>
   </Gather>
-  <Say voice="Polly.Vicki-Neural" language="de-DE">Ich habe nichts gehört. Auf Wiederhören!</Say>
+  <Say voice="alice" language="de-DE">Ich habe nichts gehört. Auf Wiederhören!</Say>
 </Response>"""
 
 def _answer_and_reprompt_twiml(answer_text: str, action_url: str) -> str:
-    """
-    Antwort sprechen und erneut nach einer weiteren Frage fragen (erneutes Gather).
-    """
     answer_text = _escape_xml(answer_text)
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Polly.Vicki-Neural" language="de-DE">{answer_text}</Say>
-  <Gather input="speech" language="de-DE" action="{action_url}" method="POST" speechTimeout="auto">
-    <Say voice="Polly.Vicki-Neural" language="de-DE"></Say>
+  <Say voice="alice" language="de-DE">{answer_text}</Say>
+  <Gather input="speech"
+          language="de-DE"
+          action="{action_url}"
+          method="POST"
+          speechTimeout="auto"
+          bargeIn="true"
+          speechModel="phone_call">
+    <Say voice="alice" language="de-DE">Möchtest du noch etwas fragen?</Say>
   </Gather>
-  <Say voice="Polly.Vicki-Neural" language="de-DE">Alles klar. Tschüss!</Say>
+  <Say voice="alice" language="de-DE">Alles klar. Tschüss!</Say>
 </Response>"""
 
 # ------------------------------------------------------------------------------
