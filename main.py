@@ -20,10 +20,13 @@ OPENAI_REALTIME_MODEL = os.getenv(
     "OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview-2024-12-17"
 ).strip()
 
-# Stimme & Latenz – wie besprochen:
-OPENAI_VOICE = os.getenv("OPENAI_VOICE", "verse").strip()           # realistischere Stimme
-TURN_SILENCE_MS = int(os.getenv("TURN_SILENCE_MS", "500"))          # ~0,5 s → schnelle Reaktion
+# Stimme & Latenz
+OPENAI_VOICE = os.getenv("OPENAI_VOICE", "verse").strip()    # realistische Stimme
+TURN_SILENCE_MS = int(os.getenv("TURN_SILENCE_MS", "450"))   # schnellere Reaktion
 OPENAI_LATENCY_MODE = os.getenv("OPENAI_LATENCY_MODE", "low").strip()
+
+# Fallback-VAD (falls server_vad nicht automatisch triggert)
+INACTIVITY_COMMIT_MS = int(os.getenv("INACTIVITY_COMMIT_MS", str(TURN_SILENCE_MS + 100)))
 
 # Pfad für Twilio-WS:
 TWILIO_WS_PATH = os.getenv("TWILIO_WS_PATH", "/twilio-media-stream").strip()
@@ -115,13 +118,11 @@ async def twilio_media_stream(ws: WebSocket):
 
     openai_url = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}"
 
-    # OpenAI-WebSocket-Verbindung aufbauen (websockets >= 12: additional_headers)
+    # OpenAI-WebSocket-Verbindung aufbauen (websockets >= 12: additional_headers als Liste von Tupeln)
     try:
         openai_ws = await websockets.connect(
             openai_url,
-            additional_headers={  # <- FIX gegenüber vorher (extra_headers ➜ additional_headers)
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-            },
+            additional_headers=[("Authorization", f"Bearer {OPENAI_API_KEY}")],
             ping_interval=20,
             ping_timeout=20,
             max_size=10_000_000,
@@ -147,20 +148,28 @@ async def twilio_media_stream(ws: WebSocket):
             ),
             "turn_detection": {
                 "type": "server_vad",
-                "silence_trigger_ms": TURN_SILENCE_MS,   # → schnelle Reaktion nach ~0,5 s Stille
+                "silence_trigger_ms": TURN_SILENCE_MS,   # zügige Reaktion
                 "prefix_padding_ms": 120,
                 "threshold": 0.5
             },
             "input_audio_format":  { "type": "g711_ulaw", "sample_rate_hz": 8000 },
             "output_audio_format": { "type": "g711_ulaw", "sample_rate_hz": 8000 },
-            "latency": OPENAI_LATENCY_MODE,  # "low" für zügigere Ausgaben
+            "latency": OPENAI_LATENCY_MODE,
         }
     }
 
     try:
         await openai_ws.send(json.dumps(session_update))
+        # Sofortige Begrüßung ausgeben:
+        await openai_ws.send(json.dumps({
+            "type": "response.create",
+            "response": {
+                "modalities": ["audio"],
+                "instructions": "Hallo! Ich bin Ihre KI am Telefon. Wie kann ich helfen?",
+            }
+        }))
     except Exception as e:
-        logger.exception("%s: session.update fehlgeschlagen: %s", APP_NAME, e)
+        logger.exception("%s: session.update/Begrüßung fehlgeschlagen: %s", APP_NAME, e)
         await openai_ws.close()
         await ws.close()
         return
@@ -169,8 +178,36 @@ async def twilio_media_stream(ws: WebSocket):
     twilio_open = True
     openai_open = True
 
+    # Fallback-VAD Status
+    loop = asyncio.get_running_loop()
+    last_audio_ts: float = 0.0
+    buffer_open = False
+    vad_task_cancelled = False
+
+    async def fallback_vad_committer():
+        """ Commit + response.create, wenn kurzzeitig keine Audioframes mehr kommen. """
+        nonlocal last_audio_ts, buffer_open, openai_open, vad_task_cancelled
+        try:
+            while openai_open and not vad_task_cancelled:
+                await asyncio.sleep(0.1)
+                if buffer_open and last_audio_ts > 0:
+                    ms_since = (loop.time() - last_audio_ts) * 1000.0
+                    if ms_since >= INACTIVITY_COMMIT_MS:
+                        try:
+                            await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                            await openai_ws.send(json.dumps({
+                                "type": "response.create",
+                                "response": {"modalities": ["audio"]}
+                            }))
+                        except Exception as e:
+                            logger.exception("%s: Fallback-VAD commit/response fehlgeschlagen: %s", APP_NAME, e)
+                        finally:
+                            buffer_open = False
+        except asyncio.CancelledError:
+            pass
+
     async def pump_twilio_to_openai():
-        nonlocal twilio_stream_sid, twilio_open, openai_open
+        nonlocal twilio_stream_sid, twilio_open, openai_open, last_audio_ts, buffer_open
         try:
             while True:
                 msg = await ws.receive_text()
@@ -196,11 +233,12 @@ async def twilio_media_stream(ws: WebSocket):
                             "type": "input_audio_buffer.append",
                             "audio": payload
                         }))
-                        # Kein commit nötig – server_vad übernimmt die Turn-Erkennung.
+                        buffer_open = True
+                        last_audio_ts = loop.time()
                 elif event == "stop":
                     logger.info("%s: Stream gestoppt: %s", APP_NAME, data)
                     break
-                # "mark" und andere Events können ignoriert/geloggt werden
+                # andere Events ignorieren/loggen
         except WebSocketDisconnect:
             logger.info("%s: Twilio WS disconnected", APP_NAME)
         except Exception as e:
@@ -214,35 +252,42 @@ async def twilio_media_stream(ws: WebSocket):
             while True:
                 raw = await openai_ws.recv()
                 if isinstance(raw, (bytes, bytearray)):
+                    # Falls OpenAI jemals binär sendet: aktuell ignorieren.
                     continue
 
                 obj = json.loads(raw)
-                typ = obj.get("type") or obj.get("event") or ""
+                t = (obj.get("type") or obj.get("event") or "").lower()
 
-                if typ in (
-                    "output_audio_chunk",
-                    "response.audio.delta",
-                    "response.output_audio.delta",
-                ):
-                    audio_b64 = obj.get("audio")
-                    if not audio_b64:
-                        delta = obj.get("delta") or {}
-                        audio_b64 = delta.get("audio")
+                # Mögliche Audio-Delta-Events abdecken
+                audio_b64: Optional[str] = None
+                if t in ("output_audio_chunk", "response.audio.delta", "response.output_audio.delta",
+                         "output_audio.delta", "response.delta"):
+                    # unterschiedliche Strukturen tolerieren
+                    if "audio" in obj and isinstance(obj["audio"], str):
+                        audio_b64 = obj["audio"]
+                    elif "delta" in obj and isinstance(obj["delta"], dict) and isinstance(obj["delta"].get("audio"), str):
+                        audio_b64 = obj["delta"]["audio"]
 
-                    if audio_b64 and twilio_stream_sid:
-                        await ws.send_text(json.dumps({
-                            "event": "media",
-                            "streamSid": twilio_stream_sid,
-                            "media": { "payload": audio_b64 }
-                        }))
+                if audio_b64 and twilio_stream_sid:
+                    await ws.send_text(json.dumps({
+                        "event": "media",
+                        "streamSid": twilio_stream_sid,
+                        "media": { "payload": audio_b64 }
+                    }))
+                    continue
 
-                elif typ in ("response.completed", "response.stop"):
+                if t in ("response.completed", "response.stop"):
                     if twilio_stream_sid:
                         await ws.send_text(json.dumps({
                             "event": "mark",
                             "streamSid": twilio_stream_sid,
                             "mark": { "name": "response_completed" }
                         }))
+                    continue
+
+                if t in ("error", "response.error"):
+                    logger.error("%s: OpenAI Error: %s", APP_NAME, obj)
+                    continue
 
         except websockets.ConnectionClosed:
             logger.info("%s: OpenAI WS geschlossen", APP_NAME)
@@ -251,9 +296,18 @@ async def twilio_media_stream(ws: WebSocket):
         finally:
             openai_open = False
 
+    # Tasks starten (inkl. Fallback-VAD)
+    vad_task = asyncio.create_task(fallback_vad_committer())
     try:
         await asyncio.gather(pump_twilio_to_openai(), pump_openai_to_twilio())
     finally:
+        # Fallback-VAD beenden
+        vad_task_cancelled = True
+        try:
+            vad_task.cancel()
+        except Exception:
+            pass
+
         try:
             if not openai_ws.closed:
                 await openai_ws.close()
