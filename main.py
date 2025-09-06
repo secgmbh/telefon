@@ -29,7 +29,6 @@ OPENAI_LATENCY_MODE = os.getenv("OPENAI_LATENCY_MODE", "low").strip()
 TWILIO_WS_PATH = os.getenv("TWILIO_WS_PATH", "/twilio-media-stream").strip()
 
 if not OPENAI_API_KEY:
-    # Hinweis im Log – die App startet trotzdem, Twilio-Webhook liefert aber Fehlertext
     print("[WARN] OPENAI_API_KEY fehlt – bitte in den Environment-Variablen setzen.")
 
 # -----------------------------------------------------------------------------
@@ -51,11 +50,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 # Hilfsfunktionen
 # -----------------------------------------------------------------------------
 def build_twiml(stream_url: str) -> str:
-    """
-    Baut eine minimalistische TwiML-Antwort, die die Voice-Session
-    per <Connect><Stream> auf unsere WebSocket-URL bridged.
-    """
-    # WICHTIG: Twilio erwartet 'text/xml'
+    """ Baut TwiML, das die Voice-Session per <Connect><Stream> auf unseren WS bridged. """
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
@@ -65,13 +60,10 @@ def build_twiml(stream_url: str) -> str:
 
 
 def build_self_ws_url(request: Request) -> str:
-    """
-    Ermittelt die öffentliche WebSocket-URL für Twilio basierend auf dem Host-Header.
-    """
+    """ Ermittelt die öffentliche WS-URL für Twilio basierend auf dem Host-Header. """
     host = request.headers.get("host") or request.url.hostname or "localhost"
     scheme = "wss"  # Auf Render via TLS
     return f"{scheme}://{host}{TWILIO_WS_PATH}"
-
 
 # -----------------------------------------------------------------------------
 # Endpunkte
@@ -96,8 +88,6 @@ async def telefon_live(request: Request):
 
     ws_url = build_self_ws_url(request)
 
-    # Wenn kein API-Key gesetzt ist, liefere ein freundliches Fehler-TwiML zurück,
-    # damit der Anrufer eine kurze Info bekommt.
     if not OPENAI_API_KEY:
         text = ("Es tut mir leid, der Dienst ist aktuell nicht konfiguriert. "
                 "Bitte später erneut versuchen.")
@@ -111,29 +101,26 @@ async def telefon_live(request: Request):
     twiml = build_twiml(ws_url)
     return Response(content=twiml, media_type="text/xml")
 
-
 # -----------------------------------------------------------------------------
 # WebSocket Bridge: Twilio <-> OpenAI Realtime
 # -----------------------------------------------------------------------------
 @app.websocket(TWILIO_WS_PATH)
 async def twilio_media_stream(ws: WebSocket):
     """
-    Nimmt die Media-Stream-WebSocket-Verbindung von Twilio entgegen und
-    bridged sie zu OpenAI Realtime per WebSocket. Audio läuft komplett als
-    G.711 μ-Law 8 kHz (input & output), d.h. keine lokale Konvertierung nötig.
+    Bridged Twilio Media Streams mit OpenAI Realtime.
+    Audio: G.711 μ-Law 8 kHz (in/out), keine lokale Konvertierung nötig.
     """
     await ws.accept()
     logger.info("%s: Twilio WS verbunden", APP_NAME)
 
     openai_url = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}"
 
-    # OpenAI-WebSocket-Verbindung aufbauen
+    # OpenAI-WebSocket-Verbindung aufbauen (websockets >= 12: additional_headers)
     try:
         openai_ws = await websockets.connect(
             openai_url,
-            extra_headers={
+            additional_headers={  # <- FIX gegenüber vorher (extra_headers ➜ additional_headers)
                 "Authorization": f"Bearer {OPENAI_API_KEY}",
-                # Optional: Subprotokolle werden serverseitig nicht benötigt, wir senden per Header
             },
             ping_interval=20,
             ping_timeout=20,
@@ -141,7 +128,6 @@ async def twilio_media_stream(ws: WebSocket):
         )
     except Exception as e:
         logger.exception("%s: OpenAI WS Verbindung fehlgeschlagen: %s", APP_NAME, e)
-        # Informiere den Anrufer kurz und trenne dann
         try:
             await ws.send_text(json.dumps({"event": "clear"}))
         except Exception:
@@ -149,7 +135,7 @@ async def twilio_media_stream(ws: WebSocket):
         await ws.close()
         return
 
-    # Session konfigurieren (Stimme, Turn Detection, Formate, Latenz)
+    # Session konfigurieren (Stimme, VAD, Formate, Latenz)
     session_update = {
         "type": "session.update",
         "session": {
@@ -162,13 +148,12 @@ async def twilio_media_stream(ws: WebSocket):
             "turn_detection": {
                 "type": "server_vad",
                 "silence_trigger_ms": TURN_SILENCE_MS,   # → schnelle Reaktion nach ~0,5 s Stille
-                "prefix_padding_ms": 120,                # schützt Satzanfang
+                "prefix_padding_ms": 120,
                 "threshold": 0.5
             },
-            # Twilio sendet μ-law/8k, wir geben auch μ-law/8k zurück:
             "input_audio_format":  { "type": "g711_ulaw", "sample_rate_hz": 8000 },
             "output_audio_format": { "type": "g711_ulaw", "sample_rate_hz": 8000 },
-            "latency": OPENAI_LATENCY_MODE,             # "low" für zügigere Ausgaben
+            "latency": OPENAI_LATENCY_MODE,  # "low" für zügigere Ausgaben
         }
     }
 
@@ -206,21 +191,16 @@ async def twilio_media_stream(ws: WebSocket):
                     media = data.get("media") or {}
                     payload = media.get("payload")
                     if payload:
-                        # μ-law/8k von Twilio direkt an OpenAI (keine Konvertierung nötig)
+                        # μ-law/8k von Twilio direkt an OpenAI
                         await openai_ws.send(json.dumps({
                             "type": "input_audio_buffer.append",
                             "audio": payload
                         }))
                         # Kein commit nötig – server_vad übernimmt die Turn-Erkennung.
-                elif event == "mark":
-                    # optional: kann für Debug/Sync genutzt werden
-                    pass
                 elif event == "stop":
                     logger.info("%s: Stream gestoppt: %s", APP_NAME, data)
                     break
-                else:
-                    # Unbekannte Events ignorieren
-                    pass
+                # "mark" und andere Events können ignoriert/geloggt werden
         except WebSocketDisconnect:
             logger.info("%s: Twilio WS disconnected", APP_NAME)
         except Exception as e:
@@ -233,30 +213,23 @@ async def twilio_media_stream(ws: WebSocket):
         try:
             while True:
                 raw = await openai_ws.recv()
-                # OpenAI kann theoretisch Binärframes schicken; wir erwarten hier JSON
                 if isinstance(raw, (bytes, bytearray)):
-                    # Falls irgendwann Binär-Audio kommt, würden wir hier umpacken;
-                    # Realtime schickt aber i.d.R. JSON mit Base64.
                     continue
 
                 obj = json.loads(raw)
                 typ = obj.get("type") or obj.get("event") or ""
 
-                # Verschiedene mögliche Audio-Eventnamen abdecken
-                # (Die Realtime-API hat in der Vergangenheit die Bezeichnungen leicht geändert.)
                 if typ in (
                     "output_audio_chunk",
                     "response.audio.delta",
                     "response.output_audio.delta",
                 ):
-                    # mögliche Felder: "audio" oder in "delta": {"audio": "..."}
                     audio_b64 = obj.get("audio")
                     if not audio_b64:
                         delta = obj.get("delta") or {}
                         audio_b64 = delta.get("audio")
 
                     if audio_b64 and twilio_stream_sid:
-                        # μ-law/8k von OpenAI direkt an Twilio:
                         await ws.send_text(json.dumps({
                             "event": "media",
                             "streamSid": twilio_stream_sid,
@@ -264,17 +237,12 @@ async def twilio_media_stream(ws: WebSocket):
                         }))
 
                 elif typ in ("response.completed", "response.stop"):
-                    # optional: Sync/Marken senden
                     if twilio_stream_sid:
                         await ws.send_text(json.dumps({
                             "event": "mark",
                             "streamSid": twilio_stream_sid,
                             "mark": { "name": "response_completed" }
                         }))
-
-                # Andere Eventtypen (z.B. Textdelta, Logs) können geloggt werden:
-                # else:
-                #     logger.debug("OpenAI Event: %s", obj)
 
         except websockets.ConnectionClosed:
             logger.info("%s: OpenAI WS geschlossen", APP_NAME)
@@ -283,11 +251,9 @@ async def twilio_media_stream(ws: WebSocket):
         finally:
             openai_open = False
 
-    # Beide Richtungen parallel pumpen
     try:
         await asyncio.gather(pump_twilio_to_openai(), pump_openai_to_twilio())
     finally:
-        # Aufräumen
         try:
             if not openai_ws.closed:
                 await openai_ws.close()
@@ -301,7 +267,6 @@ async def twilio_media_stream(ws: WebSocket):
             pass
 
         logger.info("%s: connection closed", APP_NAME)
-
 
 # -----------------------------------------------------------------------------
 # Lokaler Start (optional): uvicorn main:app --reload
