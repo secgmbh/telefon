@@ -1,335 +1,226 @@
 # main.py
+# FastAPI-App für Telefon-KI per Twilio <Gather> (Speech) + OpenAI Chat + Twilio <Say> (TTS, Polly Neural)
+# Fokus: niedrigere Latenz (barge-in, kurze Antworten) & natürlichere Stimme
+
 import os
 import json
-import base64
-import asyncio
 import logging
-from typing import Optional
+from typing import List, Dict
+from urllib import request as urlrequest
+from urllib.error import HTTPError, URLError
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import PlainTextResponse, Response, HTMLResponse
-import websockets
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import HTMLResponse, PlainTextResponse
 
-# -----------------------------------------------------------------------------
-# Konfiguration & Logging
-# -----------------------------------------------------------------------------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(level=LOG_LEVEL, format="%(levelname)s:%(name)s:%(message)s")
-log = logging.getLogger("telefon-app")
+# ------------------------------------------------------------------------------
+# Konfiguration
+# ------------------------------------------------------------------------------
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview-2024-12-17")
-OPENAI_VOICE = os.getenv("OPENAI_VOICE", "verse")
+APP_NAME = "telefon-app"
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()  # schneller, okay für Telefon
+OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
 
-if not OPENAI_API_KEY:
-    log.warning("OPENAI_API_KEY ist nicht gesetzt! Ohne Key gibt es keine Antworten.")
+# Natürlichere Stimme: Twilio unterstützt Polly Neural direkt.
+# Gute deutsche Stimmen: Polly.Marlene-Neural, Polly.Vicki-Neural
+TTS_VOICE = os.getenv("TTS_VOICE", "Polly.Marlene-Neural").strip()
+TTS_LANG = os.getenv("TTS_LANG", "de-DE").strip()
 
-# 20 ms Frames bei 8 kHz μ-law: 8000 samples/s * 0.02 s = 160 bytes
-TWILIO_FRAME_BYTES = 160
+# Modell-Feintuning für Tempo
+OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", "0.4"))
+OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "220"))
 
-app = FastAPI()
+# Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger(APP_NAME)
 
+app = FastAPI(title="Telefon-KI")
 
-# -----------------------------------------------------------------------------
+# ------------------------------------------------------------------------------
 # Hilfsfunktionen
-# -----------------------------------------------------------------------------
-def twiml_stream(ws_url: str) -> str:
-    # WICHTIG: bidirectional="true" => Nur so spielt Twilio Audio zurück!
+# ------------------------------------------------------------------------------
+
+def _twiml_response(xml: str, status_code: int = 200) -> Response:
+    return Response(content=xml, media_type="application/xml", status_code=status_code)
+
+def _escape_xml(text: str) -> str:
+    """Einfaches Escaping für <Say>-Text."""
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+def _openai_chat(messages: List[Dict[str, str]], temperature: float = OPENAI_TEMPERATURE, max_tokens: int = OPENAI_MAX_TOKENS) -> str:
+    """
+    Ruft OpenAI Chat Completions mit urllib auf (kein 'requests' nötig).
+    Gibt Assistant-Text zurück oder eine Fehlermeldung.
+    """
+    if not OPENAI_API_KEY:
+        log.error("OPENAI_API_KEY fehlt")
+        return "Entschuldigung, mein Schlüssel ist nicht konfiguriert. Bitte den Betreiber informieren."
+
+    payload = {
+        "model": OPENAI_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    data = json.dumps(payload).encode("utf-8")
+
+    req = urlrequest.Request(
+        OPENAI_CHAT_URL,
+        data=data,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+            # Keep-Alive kann bei manchen Hosts minimal helfen
+            "Connection": "keep-alive",
+        },
+    )
+
+    try:
+        # kürzeres Timeout, um Hänger zu vermeiden
+        with urlrequest.urlopen(req, timeout=15) as resp:
+            body = resp.read().decode("utf-8")
+            j = json.loads(body)
+            content = (
+                j.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+                .strip()
+            )
+            if not content:
+                log.warning("OpenAI-Antwort leer oder unerwartet: %s", body)
+                return "Dazu habe ich gerade keine passende Antwort. Formuliere es bitte kurz neu."
+            return content
+    except HTTPError as e:
+        try:
+            err_body = e.read().decode("utf-8")
+        except Exception:
+            err_body = str(e)
+        log.error("OpenAI HTTPError %s: %s", e.code, err_body)
+        return "Im Moment gibt es ein Problem bei der Verarbeitung. Bitte versuche es gleich nochmal."
+    except URLError as e:
+        log.error("OpenAI URLError: %s", e)
+        return "Ich habe gerade keine Verbindung zum Sprachmodell. Bitte später erneut versuchen."
+    except Exception as e:
+        log.exception("Unerwarteter Fehler bei OpenAI-Call: %s", e)
+        return "Da ist etwas Unerwartetes passiert. Bitte frag mich nochmal."
+
+def _base_url_from_request(req: Request) -> str:
+    # z.B. "https://dein-host.onrender.com"
+    return str(req.base_url).rstrip("/")
+
+def _gather_twiml(prompt_text: str, action_url: str) -> str:
+    """
+    Baut ein TwiML mit <Gather input="speech"> und einem Prompt (<Say>).
+    - bargeIn="true": Anrufer kann schon während der Ansage sprechen.
+    - speechModel="phone_call": passende Erkennung für Telefon.
+    """
+    prompt_text = _escape_xml(prompt_text)
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Connect>
-    <Stream url="{ws_url}" bidirectional="true"/>
-  </Connect>
-</Response>""".strip()
+  <Gather input="speech"
+          language="{TTS_LANG}"
+          action="{action_url}"
+          method="POST"
+          speechTimeout="auto"
+          bargeIn="true"
+          speechModel="phone_call">
+    <Say voice="{TTS_VOICE}" language="{TTS_LANG}">{prompt_text}</Say>
+  </Gather>
+  <Say voice="{TTS_VOICE}" language="{TTS_LANG}">Ich habe nichts gehört. Auf Wiederhören!</Say>
+</Response>"""
 
-
-async def openai_connect() -> websockets.WebSocketClientProtocol:
+def _answer_and_reprompt_twiml(answer_text: str, action_url: str) -> str:
     """
-    Baut die Realtime-WS-Verbindung zu OpenAI auf und konfiguriert
-    Audioformate + VAD. Gibt das WebSocket-Objekt zurück.
+    Antwort sprechen und erneut nach einer weiteren Frage fragen (erneutes Gather, wieder mit barge-in).
     """
-    url = f"wss://api.openai.com/v1/realtime?model={OPENAI_REALTIME_MODEL}&protocol=1.0"
-    headers = [
-        ("Authorization", f"Bearer {OPENAI_API_KEY}"),
-        ("OpenAI-Beta", "realtime=v1"),
-    ]
-    ws = await websockets.connect(uri=url, extra_headers=headers, max_size=16 * 1024 * 1024)
-    log.info("telefon-app: OpenAI WS verbunden")
+    answer_text = _escape_xml(answer_text)
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="{TTS_VOICE}" language="{TTS_LANG}">{answer_text}</Say>
+  <Gather input="speech"
+          language="{TTS_LANG}"
+          action="{action_url}"
+          method="POST"
+          speechTimeout="auto"
+          bargeIn="true"
+          speechModel="phone_call">
+    <Say voice="{TTS_VOICE}" language="{TTS_LANG}">Noch eine Frage?</Say>
+  </Gather>
+  <Say voice="{TTS_VOICE}" language="{TTS_LANG}">Alles klar. Tschüss!</Say>
+</Response>"""
 
-    # Session-Update: Deutsch, realistische Stimme, μ-law I/O, niedrige Latenz
-    sess = {
-        "type": "session.update",
-        "session": {
-            "instructions": (
-                "Sprich natürlich und freundlich auf Deutsch. "
-                "Halte Antworten kurz. Vermeide lange Pausen."
-            ),
-            "voice": OPENAI_VOICE,
-            "modalities": ["text", "audio"],
-            "input_audio_format": {"type": "g711_ulaw", "sample_rate": 8000},
-            "output_audio_format": {"type": "g711_ulaw", "sample_rate": 8000},
-            "turn_detection": {
-                "type": "server_vad",
-                # frühes Anspringen + kurze Stille für flotte Reaktionen
-                "threshold": 0.5,
-                "prefix_padding_ms": 150,
-                "silence_duration_ms": 650,
-            },
-        },
-    }
-    await ws.send(json.dumps(sess))
-    return ws
+# ------------------------------------------------------------------------------
+# Routen
+# ------------------------------------------------------------------------------
 
-
-async def send_greeting(openai_ws: websockets.WebSocketClientProtocol):
-    """
-    Löst eine kurze Begrüßung aus (Audio).
-    """
-    greeting_text = (
-        "Hallo! Ich bin bereit. Sage mir einfach, womit ich helfen kann."
-    )
-    msg = {
-        "type": "response.create",
-        "response": {
-            "modalities": ["audio"],
-            "instructions": greeting_text,
-        },
-    }
-    await openai_ws.send(json.dumps(msg))
-    log.debug("telefon-app: Begrüßung ausgelöst")
-
-
-def chunk_and_base64(buf: bytearray, chunk_size: int = TWILIO_FRAME_BYTES):
-    """
-    Zerlegt einen Bytepuffer in Base64-chunks in der gewünschten Framegröße.
-    Gibt eine Liste von base64-Strings zurück. Der Rest verbleibt im Puffer.
-    """
-    out = []
-    while len(buf) >= chunk_size:
-        piece = bytes(buf[:chunk_size])
-        del buf[:chunk_size]
-        out.append(base64.b64encode(piece).decode("ascii"))
-    return out
-
-
-# -----------------------------------------------------------------------------
-# HTTP-Routen
-# -----------------------------------------------------------------------------
 @app.get("/", response_class=HTMLResponse)
 async def root():
-    return """
-    <h1>Telefon Realtime</h1>
-    <p>Service läuft. Verwende <code>POST /telefon_live</code> als Twilio Voice Webhook.</p>
-    <p>Zum Testen im Browser: <a href="/telefon_live">/telefon_live</a> (liefert TwiML)</p>
-    """.strip()
+    return (
+        "<h1>Telefon-KI ist bereit</h1>"
+        "<p>Webhook: <code>POST /telefon_live</code></p>"
+        "<p>Action-Route: <code>POST /telefon_live/process</code></p>"
+    )
 
-
-@app.get("/healthz", response_class=PlainTextResponse)
+@app.get("/healthz")
 async def healthz():
-    return "ok"
-
-
-@app.get("/telefon_live")
-async def telefon_live_get(request: Request):
-    # Browser-Test: TwiML anzeigen
-    host = request.headers.get("host", "localhost")
-    ws_url = f"wss://{host}/twilio-media-stream"
-    xml = twiml_stream(ws_url)
-    return Response(content=xml, media_type="text/xml")
-
+    return PlainTextResponse("ok")
 
 @app.post("/telefon_live")
-async def telefon_live_post(request: Request):
+async def telefon_live(request: Request):
     """
-    Twilio Voice Webhook (POST). Liefert TwiML zurück, welches
-    Twilio mit unserem WS-Endpunkt verbindet – bidirektional!
+    Einstiegs-Webhook von Twilio (Voice → Webhook URL).
+    Gibt TwiML mit <Gather> zurück, um Sprache zu erfassen.
     """
-    form = dict(await request.form())
-    log.info("telefon-app: Twilio Voice webhook payload: %s", form)
-    host = request.headers.get("host", "localhost")
-    ws_url = f"wss://{host}/twilio-media-stream"
-    xml = twiml_stream(ws_url)
-    return Response(content=xml, media_type="text/xml")
+    form = await request.form()
+    payload = dict(form)
+    log.info("Twilio Voice webhook payload: %s", payload)
 
+    base = _base_url_from_request(request)
+    action_url = f"{base}/telefon_live/process"
 
-# -----------------------------------------------------------------------------
-# WebSocket: Twilio <-> OpenAI Brücke
-# -----------------------------------------------------------------------------
-@app.websocket("/twilio-media-stream")
-async def twilio_media_stream(ws: WebSocket):
-    await ws.accept()
-    log.info("telefon-app: Twilio WS verbunden")
+    greeting = "Hallo! Was möchtest du wissen?"
+    xml = _gather_twiml(greeting, action_url)
+    return _twiml_response(xml)
 
-    openai_ws: Optional[websockets.WebSocketClientProtocol] = None
-    stream_sid: Optional[str] = None
+@app.post("/telefon_live/process")
+async def telefon_process(request: Request):
+    """
+    Action-URL von <Gather>. Erwartet 'SpeechResult' im Twilio-POST.
+    Ruft OpenAI mit dem Transkript auf und gibt die Antwort als <Say> aus,
+    dann erneut <Gather> für die nächste Frage.
+    """
+    form = await request.form()
+    payload = dict(form)
+    log.info("Twilio Gather payload: %s", payload)
 
-    # Buffer für Audio-Out (von OpenAI zu Twilio)
-    out_buf = bytearray()
+    user_text = (payload.get("SpeechResult") or "").strip()
+    base = _base_url_from_request(request)
+    action_url = f"{base}/telefon_live/process"
 
-    # Flag & Task-Steuerung
-    running = True
-    have_uncommitted_audio = False
+    if not user_text:
+        xml = _gather_twiml("Ich habe dich nicht verstanden. Was möchtest du wissen?", action_url)
+        return _twiml_response(xml)
 
-    async def pump_twilio_to_openai():
-        nonlocal running, openai_ws, stream_sid, have_uncommitted_audio
-        last_commit = 0.0
-
-        try:
-            while running:
-                data = await ws.receive_text()
-                msg = json.loads(data)
-
-                ev = msg.get("event")
-                if ev == "start":
-                    stream_sid = msg.get("start", {}).get("streamSid")
-                    log.info("telefon-app: WS connected: %s", {"event": "start"})
-                    # OpenAI-WS hier aufbauen
-                    openai_ws = await openai_connect()
-                    # Begrüßung auslösen
-                    await send_greeting(openai_ws)
-
-                elif ev == "media":
-                    if not openai_ws:
-                        continue
-                    payload_b64 = msg.get("media", {}).get("payload")
-                    if not payload_b64:
-                        continue
-
-                    # μ-law (8k) Rohdaten direkt an OpenAI anhängen
-                    append_msg = {
-                        "type": "input_audio_buffer.append",
-                        "audio": payload_b64,  # μ-law/8k in base64
-                    }
-                    await openai_ws.send(json.dumps(append_msg))
-                    have_uncommitted_audio = True
-
-                    # Leichtes Auto-Commit zur flotten Turn-Erkennung
-                    now = asyncio.get_event_loop().time()
-                    if have_uncommitted_audio and (now - last_commit) > 0.5:
-                        await openai_ws.send(json.dumps({"type": "input_audio_buffer.commit"}))
-                        have_uncommitted_audio = False
-                        last_commit = now
-
-                elif ev == "mark":
-                    # Optional: auf Marker reagieren
-                    pass
-
-                elif ev == "stop":
-                    log.info("telefon-app: Stream gestoppt: %s", msg.get("stop") or msg)
-                    running = False
-                    break
-
-        except WebSocketDisconnect:
-            log.info("telefon-app: Twilio WS getrennt")
-        except Exception as e:
-            log.exception("telefon-app: Fehler im Twilio->OpenAI Pump: %s", e)
-        finally:
-            running = False
-
-    async def pump_openai_to_twilio():
-        nonlocal running, openai_ws, out_buf, stream_sid
-        if not openai_ws:
-            # auf Aufbau warten
-            for _ in range(40):
-                if openai_ws:
-                    break
-                await asyncio.sleep(0.05)
-        if not openai_ws:
-            log.error("telefon-app: OpenAI WS nicht verfügbar; kein Audio-Out.")
-            return
-
-        try:
-            while running:
-                raw = await openai_ws.recv()
-                try:
-                    msg = json.loads(raw)
-                except Exception:
-                    # Falls OpenAI binäre Frames schickt (sollte nicht passieren in v1.0)
-                    continue
-
-                mtype = msg.get("type")
-
-                if mtype == "response.audio.delta":
-                    # Audio kommt als base64 (μ-law/8k). Wir schicken in 20ms-Frames an Twilio.
-                    audio_b64 = msg.get("audio")
-                    if audio_b64:
-                        out_buf.extend(base64.b64decode(audio_b64))
-                        chunks = chunk_and_base64(out_buf, TWILIO_FRAME_BYTES)
-                        for c in chunks:
-                            if not stream_sid:
-                                continue
-                            await ws.send_text(json.dumps({
-                                "event": "media",
-                                "streamSid": stream_sid,
-                                "media": {"payload": c}
-                            }))
-                elif mtype == "response.completed":
-                    # Rest puffern & raus
-                    chunks = chunk_and_base64(out_buf, TWILIO_FRAME_BYTES)
-                    for c in chunks:
-                        if not stream_sid:
-                            continue
-                        await ws.send_text(json.dumps({
-                            "event": "media",
-                            "streamSid": stream_sid,
-                            "media": {"payload": c}
-                        }))
-                elif mtype == "error":
-                    log.error("telefon-app: OpenAI Fehler: %s", msg)
-                # Weitere Typen ignorieren wir bewusst (Logs wären zu laut)
-
-        except Exception as e:
-            if running:
-                log.exception("telefon-app: Fehler im OpenAI->Twilio Pump: %s", e)
-        finally:
-            running = False
-
-    async def keepalive_marks():
-        """
-        Optional: regelmäßig Mark-Events senden; einige Clients nutzen das zum Flushing.
-        """
-        while running:
-            await asyncio.sleep(5)
-            if stream_sid:
-                try:
-                    await ws.send_text(json.dumps({
-                        "event": "mark",
-                        "streamSid": stream_sid,
-                        "mark": {"name": "keepalive"}
-                    }))
-                except Exception:
-                    break
-
-    # Tasks starten
-    tasks = [
-        asyncio.create_task(pump_twilio_to_openai()),
-        asyncio.create_task(pump_openai_to_twilio()),
-        asyncio.create_task(keepalive_marks()),
+    # Kurzer, telefonoptimierter Stil
+    system_prompt = (
+        "Du bist eine freundliche, prägnante Telefon-KI auf Deutsch. "
+        "Antworte in maximal zwei kurzen Sätzen, klar und ohne Fachjargon. "
+        "Wenn sinnvoll, nenne eine konkrete nächste Option oder Frage."
+    )
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_text},
     ]
+    answer = _openai_chat(messages)
 
-    # Auf Ende warten
-    try:
-        await asyncio.gather(*tasks)
-    finally:
-        # Aufräumen
-        for t in tasks:
-            if not t.done():
-                t.cancel()
-        if openai_ws:
-            try:
-                await openai_ws.close()
-            except Exception:
-                pass
-        try:
-            await ws.close()
-        except Exception:
-            pass
-
-
-# -----------------------------------------------------------------------------
-# Uvicorn Start (nur lokal relevant – Render startet via Gunicorn)
-# -----------------------------------------------------------------------------
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", "10000"))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
+    # Antwort sprechen + erneut nachfragen
+    xml = _answer_and_reprompt_twiml(answer, action_url)
+    return _twiml_response(xml)
