@@ -1,9 +1,10 @@
-# main.py
+# main.py (Twilio ↔ OpenAI Realtime, Deutsch)
 import os
 import json
 import asyncio
 import traceback
 from typing import Optional
+from urllib.parse import parse_qs
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, HTMLResponse, PlainTextResponse
@@ -96,33 +97,36 @@ def _http_to_ws(url: str) -> str:
 
 @app.api_route("/telefon_live", methods=["GET","POST"])
 async def telefon_live(request: Request):
+    # TwiML mit bidirektionalem Stream. WICHTIG: kein track="both" (führt zu 31941).
     ws_url = _http_to_ws(str(request.url_for("twilio_stream")))
     status_url = str(request.url_for("stream_status"))
     print(f"TwiML requested. Using stream URL: {ws_url} | statusCallback: {status_url}")
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="{ws_url}" track="both" statusCallback="{status_url}"/>
+    <Stream url="{ws_url}" statusCallback="{status_url}"/>
   </Connect>
 </Response>"""
     return Response(content=twiml, media_type="application/xml")
 
 @app.api_route("/stream-status", methods=["POST","GET"])
 async def stream_status(request: Request):
+    # Robuste Verarbeitung auch ohne python-multipart
     try:
-        content_type = request.headers.get("content-type","")
-        if "application/x-www-form-urlencoded" in content_type:
-            form = await request.form()
-            print("Twilio StreamStatus:", dict(form))
+        ctype = request.headers.get("content-type","")
+        raw = (await request.body()).decode("utf-8", "ignore")
+        if "application/x-www-form-urlencoded" in ctype:
+            data = {k:(v[0] if len(v)==1 else v) for k,v in parse_qs(raw).items()}
+            print("Twilio StreamStatus:", data)
         else:
-            body = await request.body()
-            print("Twilio StreamStatus (raw):", body.decode("utf-8", errors="ignore"))
+            print("Twilio StreamStatus (raw):", raw or "(empty)")
     except Exception as e:
         print("StreamStatus parse error:", repr(e))
     return PlainTextResponse("ok")
 
 @app.websocket("/twilio-stream")
 async def twilio_stream(ws: WebSocket):
+    # Subprotokoll übernehmen, falls angeboten
     req_proto = ws.headers.get("sec-websocket-protocol", "")
     requested = [p.strip() for p in req_proto.split(",") if p.strip()]
     subproto = None
@@ -190,6 +194,7 @@ class TwilioOpenAIBridge:
                 return await self._connect_openai(attempt + 1)
             raise
 
+        # Session-Update: Deutsch + μ-law + VAD + Stimme
         await self._oai_send_json({
             "type": "session.update",
             "session": {
@@ -202,6 +207,7 @@ class TwilioOpenAIBridge:
             },
         }, "session.update")
 
+        # Begrüßung
         await self._oai_send_json({
             "type":"response.create",
             "response": {"modalities":["audio","text"], "instructions": AUTO_GREETING}
@@ -236,6 +242,12 @@ class TwilioOpenAIBridge:
             self.oai_ws = None
 
     async def _pipe_twilio_to_openai(self):
+        """
+        Twilio → OpenAI:
+        - event 'media': μ-law Base64 → input_audio_buffer.append
+        - event 'start': streamSid merken, nach Begrüßung kurz muten
+        - event 'stop': Ende
+        """
         async for message in self.twilio_ws.iter_text():
             try:
                 data = json.loads(message)
@@ -257,6 +269,9 @@ class TwilioOpenAIBridge:
                         {"type": "input_audio_buffer.append", "audio": payload},
                         "input_audio_buffer.append"
                     )
+            elif etype == "mark":
+                # optional: auf Marks reagieren (z.B. commit)
+                pass
             elif etype == "stop":
                 print("Twilio stop (call ended)")
                 break
@@ -264,6 +279,10 @@ class TwilioOpenAIBridge:
         print("Twilio reader: stream ended")
 
     async def _pipe_openai_to_twilio(self):
+        """
+        OpenAI → Twilio:
+        - response.output_audio.delta: μ-law Base64 als 'media' mit streamSid
+        """
         if not self.oai_ws:
             print("OAI reader: socket missing, abort")
             return
@@ -288,7 +307,10 @@ class TwilioOpenAIBridge:
                             "media": {"payload": audio}
                         }))
                 elif mtype == "response.completed":
+                    # kleine Pause, damit man „dazwischen“ kommt
                     await asyncio.sleep(0.6)
+                else:
+                    pass
         except websockets.exceptions.ConnectionClosedError as e:
             print("OAI pipe error:", repr(e))
         except Exception as e:
